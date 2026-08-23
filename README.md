@@ -4,6 +4,9 @@ Compress images and videos on Windows with the best possible quality-to-size rat
 
 ## Features
 
+- **Parallel by default** — separate worker pools for images (CPU) and videos (GPU), tuned automatically to your machine
+- **Auto-benchmark** — `setup.ps1` measures CPU cores, RAM, and how many NVENC sessions your GPU can run at once, then writes sensible defaults to `config.json`
+- **Live progress UI** — a single in-place status block (progress bar, active workers, ETA, recent completions) instead of scrolling spam; falls back to periodic lines when output is redirected
 - **Recursive scan** — point it at a folder and it processes every image/video in all subfolders
 - **GPU-accelerated video** — HEVC/AV1 encoding via NVIDIA NVENC (auto-detected), falls back to CPU (x265/x264) when unavailable
 - **Smart image compression** — lossless first (jpegoptim, oxipng), light lossy only when it saves meaningfully (pngquant)
@@ -48,50 +51,70 @@ Or simply **drag-and-drop a folder onto `Optimize-Media.cmd`**.
 | `-Codec hevc\|h264\|av1` | Force a specific video codec |
 | `-MinSaving 5` | Skip replacement if savings are below X % |
 | `-Include` / `-Exclude` | Filter by extension (e.g. `-Include jpg,png`) |
+| `-ImageWorkers N` | Override parallel image workers for this run |
+| `-VideoWorkers N` | Override parallel video workers for this run |
+
+## Performance tuning
+
+`setup.ps1` runs `Benchmark-Machine.ps1`, which measures your CPU cores, RAM, and the number of concurrent NVENC sessions your GPU actually supports. Results are written to `config.json`:
+
+```json
+"performance": {
+    "imageWorkers": 12,
+    "videoWorkers": 3,
+    "nvencSessions": 4
+}
+```
+
+Edit these values to tune throughput manually, or re-run `.\Benchmark-Machine.ps1` (use `-Force` to discard your manual tuning and re-measure). Per-run overrides: `-ImageWorkers` / `-VideoWorkers`.
 
 ## Example output
 
 ```
-[3/128] IMG_2041.jpg   4.2 MB -> 1.1 MB  (-74%)  jpegoptim-lossless  0.6s
-[4/128] clip.mp4     165.0 MB -> 17.8 MB (-89%)  hevc_nvenc cq25 [GPU]  21s
-    Overall: 35% | saved 150 MB | ETA ~4m
+==================================================
+  Optimize-Media  |  preset: balanced  |  video: hevc (hevc_nvenc [GPU])
+  Workers: 12 images + 3 videos (parallel)
+==================================================
+Scanned: 752 files (680 images, 72 videos) - 2.14 GB
+
+[################--------]  67.0%  |  504/752 files  |  saved 1.1 GB  |  ETA 3m 12s
+  working: wedding_aisle.mp4
+  working: party_dance.mp4
+  recent: IMG_2041.jpg -74%  |  clip.mp4 -89%
 
 ==================================================
   RESULTS
 ==================================================
-  Compressed : 87 files
+  Compressed : 711 files
   Skipped    : 41 files
   Before     : 2.14 GB
   After      : 486.20 MB
   Saved      : 1.67 GB  (77.7%)
-  Time       : 12m 04s
-    Images:   72 files | 512 MB -> 198 MB | saved 314 MB (61%)
-    Videos:   15 files | 1.63 GB -> 288 MB | saved 1.36 GB (84%)
-
-Detailed report: logs\report-20260823-161510.csv
+  Time       : 12m 04s  (3 MB/s processed)
+    Images:  680 files | 512 MB -> 198 MB | saved 314 MB (61%)
+    Videos:   31 files | 1.63 GB -> 288 MB | saved 1.36 GB (84%)
 ```
 
 ## How it works
 
-1. `setup.ps1` downloads portable binaries into `tools\` (no admin needed) and detects your GPU's NVENC capabilities, saving everything to `config.json`.
-2. `Optimize-Media.ps1` scans the target, classifies files, and routes each to the right pipeline:
-   - **JPEG** → jpegoptim (lossless) / mozjpeg
-   - **PNG** → oxipng (lossless) → pngquant (light lossy if still large)
-   - **GIF/WebP/others** → ffmpeg re-encode
-   - **Video** → ffmpeg with NVENC (GPU) or x265/x264 (CPU), audio copied untouched
-3. Each output is verified (decodes cleanly, video duration matches) before the original is replaced. Files that would save less than `-MinSaving`% keep the original.
-4. Every processed file is logged to `logs\history.csv` so re-runs skip them.
+1. `setup.ps1` downloads portable binaries into `tools\` (no admin needed), detects your GPU's NVENC capabilities, and benchmarks your machine — all saved to `config.json`.
+2. `Optimize-Media.ps1` scans the target, splits work into two queues, and processes them **in parallel**:
+   - **Image pool** (default: logical cores − 4 workers) — jpegoptim (lossless) / mozjpeg for JPEG, oxipng → pngquant for PNG, ffmpeg for GIF/WebP/others
+   - **Video pool** (default: NVENC session count − 1 workers) — ffmpeg with NVENC (GPU) or x265/x264 (CPU), audio copied untouched
+3. Each worker compresses to a local temp file, verifies the output (decodes cleanly, video duration matches), and only then replaces the original. Files that would save less than `-MinSaving`% keep the original.
+4. A single in-place progress block shows overall %, active workers, ETA, and recent completions. Every processed file is logged to `logs\history.csv` so re-runs skip them.
 
 ## File layout
 
 ```
-Optimize-Media.ps1   Main CLI
-Optimize-Media.cmd   Drag-and-drop wrapper
-setup.ps1            One-time tool installer
-tools\               Portable binaries (gitignored, created by setup)
-logs\                CSV reports + history (gitignored)
-backup\              Originals when using -Backup (gitignored)
-config.json          Machine-specific config (gitignored, created by setup)
+Optimize-Media.ps1      Main CLI (parallel engine)
+Optimize-Media.cmd      Drag-and-drop wrapper
+setup.ps1               One-time tool installer
+Benchmark-Machine.ps1   Measures your machine, writes performance defaults
+tools\                  Portable binaries (gitignored, created by setup)
+logs\                   CSV reports + history (gitignored)
+backup\                 Originals when using -Backup (gitignored)
+config.json             Machine-specific config (gitignored, created by setup)
 ```
 
 ## Moving to another PC

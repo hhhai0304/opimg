@@ -304,3 +304,9 @@ if ($tools['ffmpeg'].Path -and $tools['ffprobe'].Path) {
 
 # clean temp downloads
 Remove-Item $dlDir -Recurse -Force -ErrorAction SilentlyContinue
+
+# ============================================================ benchmark -> performance defaults
+$bench = Join-Path $script:RootDir 'Benchmark-Machine.ps1'
+if (Test-Path $bench) {
+    & $bench
+}

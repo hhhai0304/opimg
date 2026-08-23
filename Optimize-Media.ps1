@@ -3,9 +3,11 @@
 .SYNOPSIS
     Optimize-Media - Compress images and videos optimally while keeping the best possible quality.
 .DESCRIPTION
-    Recursively scans a folder (or a single file) for media, compresses in place using GPU (NVENC)
-    or CPU, verifies each output, and only replaces the original when smaller and still readable.
-    Reports before/after, savings %, and the tool used. Re-runs automatically skip already-done files.
+    Recursively scans a folder (or a single file) for media, compresses in parallel using GPU
+    (NVENC) and CPU worker pools, verifies each output, and only replaces the original when
+    smaller and valid. Re-runs automatically skip already-processed files.
+    Parallelism is tuned automatically from config.json (run Benchmark-Machine.ps1 to re-measure,
+    or edit the "performance" section by hand).
 .EXAMPLE
     .\Optimize-Media.ps1 "\\NAS\share\path\to\media"
     .\Optimize-Media.ps1 "\\NAS\share\Photos" -Preset max -Backup
@@ -30,16 +32,19 @@ param(
     [double]$MinSaving = 5,
 
     [string[]]$Include,
-    [string[]]$Exclude
+    [string[]]$Exclude,
+
+    # 0 = use config.json performance defaults
+    [int]$ImageWorkers = 0,
+    [int]$VideoWorkers = 0
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$script:RootDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:ToolsDir = Join-Path $script:RootDir 'tools'
-$script:TempDir  = Join-Path $script:RootDir 'temp'
-$script:LogDir   = Join-Path $script:RootDir 'logs'
+$script:RootDir   = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:TempDir   = Join-Path $script:RootDir 'temp'
+$script:LogDir    = Join-Path $script:RootDir 'logs'
 $script:BackupDir = Join-Path $script:RootDir 'backup'
 $script:ConfigPath = Join-Path $script:RootDir 'config.json'
 
@@ -54,13 +59,12 @@ function Format-Size([double]$bytes) {
     return "$bytes B"
 }
 function Format-Duration([double]$sec) {
-    $t = [TimeSpan]::FromSeconds([math]::Round($sec))
+    $t = [TimeSpan]::FromSeconds([math]::Round([math]::Max(0, $sec)))
     if ($t.TotalHours -ge 1) { return $t.ToString('h\h\ mm\m') }
     return $t.ToString('m\m\ ss\s')
 }
 function Write-Info([string]$msg)  { Write-Host $msg -ForegroundColor Gray }
 function Write-Ok([string]$msg)    { Write-Host $msg -ForegroundColor Green }
-function Write-Skip([string]$msg)  { Write-Host $msg -ForegroundColor DarkGray }
 function Write-Warn2([string]$msg) { Write-Host $msg -ForegroundColor Yellow }
 function Write-Err([string]$msg)   { Write-Host $msg -ForegroundColor Red }
 
@@ -78,17 +82,29 @@ $FFMPEG   = [string]$cfg.tools.ffmpeg
 $FFPROBE  = [string]$cfg.tools.ffprobe
 $OXIPNG   = [string]$cfg.tools.oxipng
 $PNGQUANT = [string]$cfg.tools.pngquant
-$JPEGTOOL = [string]$cfg.tools.cjpeg          # may be jpegoptim or cjpeg
-$JPEGKIND = [string]$cfg.tools.'cjpeg_kind'   # 'jpegoptim' | '' (cjpeg) | $null
+$JPEGTOOL = [string]$cfg.tools.cjpeg
+$JPEGKIND = [string]$cfg.tools.'cjpeg_kind'
 $HAS_NVENC = [bool]$cfg.gpu.nvenc
 $HAS_AV1NV = [bool]$cfg.gpu.av1_nvenc
+
+# performance defaults (fallbacks if benchmark has not run yet)
+$perfProp = $cfg.PSObject.Properties['performance']
+$perf = @{}
+if ($perfProp) { $perfProp.Value.PSObject.Properties | ForEach-Object { $perf[$_.Name] = $_.Value } }
+$logical = if ($perf.logicalCores) { [int]$perf.logicalCores } else { [int](Get-CimInstance Win32_Processor).NumberOfLogicalProcessors }
+if ($ImageWorkers -le 0) { $ImageWorkers = if ($perf.imageWorkers) { [int]$perf.imageWorkers } else { [math]::Max(2, $logical - 4) } }
+if ($VideoWorkers -le 0) {
+    $VideoWorkers = if ($perf.videoWorkers) { [int]$perf.videoWorkers }
+    elseif ($HAS_NVENC) { 2 } else { 2 }
+}
+$ImageWorkers = [math]::Max(1, $ImageWorkers)
+$VideoWorkers = [math]::Max(1, $VideoWorkers)
 
 foreach ($d in @($script:TempDir, $script:LogDir)) {
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d | Out-Null }
 }
 
 # ============================================================ preset config
-# Lower CQ = higher quality, larger file
 $PRESETS = @{
     fast     = @{ cq = 28; nvPreset = 'p4'; cpuCrf = 26; cpuPreset = 'fast';   jpgQ = 82; pngQ = '75-90'  }
     balanced = @{ cq = 25; nvPreset = 'p6'; cpuCrf = 23; cpuPreset = 'medium'; jpgQ = 85; pngQ = '80-95'  }
@@ -97,7 +113,6 @@ $PRESETS = @{
 }
 $P = $PRESETS[$Preset]
 
-# video codec
 if (-not $Codec) {
     $Codec = switch ($Preset) {
         'archive' { 'h264' }
@@ -105,7 +120,6 @@ if (-not $Codec) {
         default   { 'hevc' }
     }
 }
-# map codec -> actual encoder
 $encMap = @{
     hevc = @{ gpu = 'hevc_nvenc'; cpu = 'libx265'; tag = 'hvc1' }
     h264 = @{ gpu = 'h264_nvenc'; cpu = 'libx264'; tag = 'avc1' }
@@ -116,10 +130,10 @@ $encoder = if ($useGpu) { $encMap[$Codec].gpu } else { $encMap[$Codec].cpu }
 
 Write-Host "==================================================" -ForegroundColor Magenta
 Write-Host "  Optimize-Media  |  preset: $Preset  |  video: $Codec ($encoder$(if($useGpu){' [GPU]'}))" -ForegroundColor Magenta
+Write-Host "  Workers: $ImageWorkers images + $VideoWorkers videos (parallel)" -ForegroundColor Magenta
 Write-Host "==================================================" -ForegroundColor Magenta
 
 # ============================================================ collect files
-# strip stray quotes when user pastes a quoted string into the prompt
 $Path = $Path.Trim().Trim('"', "'")
 
 if (-not (Test-Path -LiteralPath $Path)) {
@@ -156,7 +170,6 @@ $nImg = @($mediaFiles | Where-Object Kind -eq 'image').Count
 $nVid = @($mediaFiles | Where-Object Kind -eq 'video').Count
 Write-Host "Scanned: $($mediaFiles.Count) files ($nImg images, $nVid videos) - $(Format-Size $totalBytesBefore)" -ForegroundColor Cyan
 Write-Info "Source: $scanRoot"
-if ($WhatIf) { Write-Warn2 "WhatIf mode: estimate only, no compression will run.`n" }
 
 # ============================================================ history (skip already-processed files)
 $historyPath = Join-Path $script:LogDir 'history.csv'
@@ -165,239 +178,327 @@ if ((Test-Path $historyPath) -and (-not $Force)) {
     Import-Csv $historyPath | ForEach-Object { $history[$_.path] = $true }
 }
 
-$reportFile = Join-Path $script:LogDir ("report-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + ".csv")
-$results = New-Object System.Collections.Generic.List[object]
+# split into work queues (skip history + non-target files)
+$imgQueue = @($mediaFiles | Where-Object { $_.Kind -eq 'image' -and -not $history.ContainsKey($_.File.FullName) })
+$vidQueue = @($mediaFiles | Where-Object { $_.Kind -eq 'video' -and -not $history.ContainsKey($_.File.FullName) })
+$preSkipped = $mediaFiles.Count - $imgQueue.Count - $vidQueue.Count
+if ($preSkipped -gt 0) { Write-Info "Already processed earlier: $preSkipped files (skipped)" }
 
-# ============================================================ verify + process functions
-function Get-VideoDuration([string]$file) {
-    try {
-        $o = & $FFPROBE -v error -show_entries format=duration -of csv=p=0 $file 2>&1
-        return [double]$o
-    } catch { return -1 }
-}
-
-function Test-VideoValid([string]$file) {
-    # decode the whole file; success means it is readable
-    & $FFMPEG -v error -i $file -f null - 2>&1 | Out-Null
-    return ($LASTEXITCODE -eq 0)
-}
-
-function Test-ImageValid([string]$file) {
-    & $FFMPEG -v error -i $file -f null - 2>&1 | Out-Null
-    return ($LASTEXITCODE -eq 0)
-}
-
-function Backup-Original([string]$srcFile, [string]$root) {
-    $rel = $srcFile
-    if ($srcFile.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
-        $rel = $srcFile.Substring($root.Length).TrimStart('\', '/')
+if ($WhatIf) {
+    Write-Warn2 "`nWhatIf mode: estimate only, no compression will run."
+    $i = 0
+    foreach ($q in @($vidQueue + $imgQueue)) {
+        $i++
+        Write-Info ("[{0}/{1}] Would compress: {2} ({3})" -f $i, ($vidQueue.Count + $imgQueue.Count), $q.File.Name, (Format-Size $q.File.Length))
     }
-    $dest = Join-Path $script:BackupDir $rel
-    $destDir = Split-Path $dest -Parent
-    if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
-    Copy-Item -LiteralPath $srcFile -Destination $dest -Force
+    Write-Host "`nTotal: $($mediaFiles.Count) files, $(Format-Size $totalBytesBefore)"
+    if ($Host.Name -eq 'ConsoleHost' -and -not $env:OM_IGNORE_PAUSE) {
+        Write-Host "`nPress Enter to close..." -ForegroundColor Yellow
+        Read-Host | Out-Null
+    }
+    exit 0
 }
 
-function Compress-Image([pscustomobject]$item, [string]$workDir) {
+if (($imgQueue.Count + $vidQueue.Count) -eq 0) {
+    Write-Ok "Nothing to do - every file was already processed."
+    exit 0
+}
+
+# ============================================================ worker script block
+$workerScript = {
+    param([object]$item, [hashtable]$ctx, [hashtable]$state)
+
+    function Get-VideoDuration([string]$file) {
+        try {
+            $o = & $ctx.FFPROBE -v error -show_entries format=duration -of csv=p=0 $file 2>&1
+            return [double]$o
+        } catch { return -1 }
+    }
+    function Test-MediaValid([string]$file) {
+        & $ctx.FFMPEG -v error -i $file -f null - 2>&1 | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    }
+    function Update-Active([string]$label) {
+        [System.Threading.Monitor]::Enter($state.SyncRoot)
+        try {
+            if ($label) { $state.Active[$item.File.FullName] = $label }
+            else { $state.Active.Remove($item.File.FullName) }
+        } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+    }
+
     $src = $item.File.FullName
     $ext = $item.Ext
-    $tmp = Join-Path $workDir ("img_" + [guid]::NewGuid().ToString('N') + $ext)
-    Copy-Item -LiteralPath $src -Destination $tmp -Force
-    $tool = 'none'
+    $sizeBefore = $item.File.Length
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $tmp = $null
 
     try {
-        switch -Regex ($ext) {
-            '\.jpe?g$' {
-                if ($JPEGTOOL -and $JPEGKIND -eq 'jpegoptim') {
-                    # lossless: optimize only, no quality loss
-                    & $JPEGTOOL --strip-all --all-progressive $tmp 2>&1 | Out-Null
-                    $tool = 'jpegoptim-lossless'
-                } elseif ($JPEGTOOL) {
-                    # cjpeg (mozjpeg) - re-encode at high quality
-                    $tmpOut = "$tmp.out.jpg"
-                    & $JPEGTOOL -quality $P.jpgQ -optimize -progressive -outfile $tmpOut $tmp 2>&1 | Out-Null
-                    if (Test-Path $tmpOut) { Move-Item $tmpOut $tmp -Force }
-                    $tool = "mozjpeg-q$($P.jpgQ)"
-                } else {
-                    # fallback to ffmpeg mjpeg
-                    $tmpOut = "$tmp.out.jpg"
-                    & $FFMPEG -y -v error -i $tmp -c:v mjpeg -q:v 2 -map_metadata -1 $tmpOut 2>&1 | Out-Null
-                    if (Test-Path $tmpOut) { Move-Item $tmpOut $tmp -Force }
-                    $tool = 'ffmpeg-mjpeg'
-                }
-            }
-            '\.png$' {
-                # 1) lossless first
-                if ($OXIPNG) {
-                    & $OXIPNG -o 4 --strip safe $tmp 2>&1 | Out-Null
-                    $tool = 'oxipng'
-                }
-                # 2) if still large, try light lossy with pngquant
-                if ($PNGQUANT -and (Get-Item $tmp).Length -gt 200KB) {
-                    $tmpQ = "$tmp.q.png"
-                    & $PNGQUANT --quality=$($P.pngQ) --speed 1 --strip --force --output $tmpQ $tmp 2>&1 | Out-Null
-                    if ((Test-Path $tmpQ) -and ((Get-Item $tmpQ).Length -lt (Get-Item $tmp).Length * 0.92)) {
-                        Move-Item $tmpQ $tmp -Force
-                        $tool = "oxipng+pngquant($($P.pngQ))"
+        Update-Active $item.File.Name
+
+        if ($item.Kind -eq 'image') {
+            $tmp = Join-Path $ctx.TempDir ("img_" + [guid]::NewGuid().ToString('N') + $ext)
+            Copy-Item -LiteralPath $src -Destination $tmp -Force
+            $tool = 'none'
+
+            switch -Regex ($ext) {
+                '\.jpe?g$' {
+                    if ($ctx.JPEGTOOL -and $ctx.JPEGKIND -eq 'jpegoptim') {
+                        & $ctx.JPEGTOOL --strip-all --all-progressive $tmp 2>&1 | Out-Null
+                        $tool = 'jpegoptim-lossless'
+                    } elseif ($ctx.JPEGTOOL) {
+                        $tmpOut = "$tmp.out.jpg"
+                        & $ctx.JPEGTOOL -quality $ctx.jpgQ -optimize -progressive -outfile $tmpOut $tmp 2>&1 | Out-Null
+                        if (Test-Path $tmpOut) { Move-Item $tmpOut $tmp -Force }
+                        $tool = "mozjpeg-q$($ctx.jpgQ)"
                     } else {
-                        Remove-Item $tmpQ -Force -ErrorAction SilentlyContinue
+                        $tmpOut = "$tmp.out.jpg"
+                        & $ctx.FFMPEG -y -v error -i $tmp -c:v mjpeg -q:v 2 -map_metadata -1 $tmpOut 2>&1 | Out-Null
+                        if (Test-Path $tmpOut) { Move-Item $tmpOut $tmp -Force }
+                        $tool = 'ffmpeg-mjpeg'
                     }
                 }
+                '\.png$' {
+                    if ($ctx.OXIPNG) {
+                        & $ctx.OXIPNG -o 4 --strip safe $tmp 2>&1 | Out-Null
+                        $tool = 'oxipng'
+                    }
+                    if ($ctx.PNGQUANT -and (Get-Item $tmp).Length -gt 200KB) {
+                        $tmpQ = "$tmp.q.png"
+                        & $ctx.PNGQUANT --quality=$($ctx.pngQ) --speed 1 --strip --force --output $tmpQ $tmp 2>&1 | Out-Null
+                        if ((Test-Path $tmpQ) -and ((Get-Item $tmpQ).Length -lt (Get-Item $tmp).Length * 0.92)) {
+                            Move-Item $tmpQ $tmp -Force
+                            $tool = "oxipng+pngquant($($ctx.pngQ))"
+                        } else {
+                            Remove-Item $tmpQ -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+                '\.gif$' {
+                    $tmpOut = "$tmp.out.gif"
+                    & $ctx.FFMPEG -y -v error -i $tmp -map_metadata -1 $tmpOut 2>&1 | Out-Null
+                    if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
+                    $tool = 'ffmpeg-gif'
+                }
+                '\.webp$' {
+                    $tmpOut = "$tmp.out.webp"
+                    & $ctx.FFMPEG -y -v error -i $tmp -c:v libwebp -quality 85 -map_metadata -1 $tmpOut 2>&1 | Out-Null
+                    if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
+                    $tool = 'libwebp-q85'
+                }
+                default {
+                    $tmpOut = "$tmp.out$ext"
+                    & $ctx.FFMPEG -y -v error -i $tmp -map_metadata -1 $tmpOut 2>&1 | Out-Null
+                    if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
+                    $tool = 'ffmpeg'
+                }
             }
-            '\.gif$' {
-                $tmpOut = "$tmp.out.gif"
-                & $FFMPEG -y -v error -i $tmp -map_metadata -1 $tmpOut 2>&1 | Out-Null
-                if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
-                $tool = 'ffmpeg-gif'
+
+            if (-not (Test-MediaValid $tmp)) { throw 'output is unreadable' }
+
+        } else {
+            # -------- video --------
+            $tmp = Join-Path $ctx.TempDir ("vid_" + [guid]::NewGuid().ToString('N') + '.mp4')
+            $durBefore = Get-VideoDuration $src
+
+            $encArgs = @()
+            if ($ctx.useGpu) {
+                $encArgs = @('-c:v', $ctx.encoder, '-preset', $ctx.nvPreset, '-cq', $ctx.cq, '-rc', 'constqp')
+                if ($ctx.Codec -eq 'av1') { $encArgs = @('-c:v', $ctx.encoder, '-preset', $ctx.nvPreset, '-cq', $ctx.cq) }
+            } else {
+                $encArgs = @('-c:v', $ctx.encoder, '-crf', $ctx.cpuCrf, '-preset', $ctx.cpuPreset)
+                if ($ctx.Codec -eq 'hevc') { $encArgs += @('-tag:v', 'hvc1') }
             }
-            '\.webp$' {
-                $tmpOut = "$tmp.out.webp"
-                & $FFMPEG -y -v error -i $tmp -c:v libwebp -quality 85 -map_metadata -1 $tmpOut 2>&1 | Out-Null
-                if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
-                $tool = 'libwebp-q85'
-            }
-            default {
-                # bmp/tiff/heic... -> light re-encode via ffmpeg
-                $tmpOut = "$tmp.out$ext"
-                & $FFMPEG -y -v error -i $tmp -map_metadata -1 $tmpOut 2>&1 | Out-Null
-                if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
-                $tool = 'ffmpeg'
+            $tool = "$($ctx.encoder) cq$($ctx.cq)" + $(if ($ctx.useGpu) { ' [GPU]' } else { ' [CPU]' })
+
+            $argsList = @('-y', '-v', 'error', '-i', $src) + $encArgs + @('-c:a', 'copy', '-c:s', 'copy', '-map_metadata', '-1', '-movflags', '+faststart', $tmp)
+            & $ctx.FFMPEG @argsList 2>&1 | Out-Null
+
+            if (-not (Test-Path $tmp)) { throw 'ffmpeg did not produce an output' }
+            if (-not (Test-MediaValid $tmp)) { throw 'output failed to decode' }
+            $durAfter = Get-VideoDuration $tmp
+            if ($durBefore -gt 0 -and $durAfter -gt 0 -and [math]::Abs($durAfter - $durBefore) -gt 1.0) {
+                throw "duration mismatch ($durBefore vs $durAfter)"
             }
         }
-    } catch {
-        return @{ ok = $false; error = $_.Exception.Message }
-    }
 
-    if (-not (Test-ImageValid $tmp)) {
-        return @{ ok = $false; error = 'output is unreadable' }
-    }
-    return @{ ok = $true; outFile = $tmp; tool = $tool }
-}
+        $sizeAfter = (Get-Item $tmp).Length
+        $savingPct = if ($sizeBefore -gt 0) { (1 - $sizeAfter / $sizeBefore) * 100 } else { 0 }
 
-function Compress-Video([pscustomobject]$item, [string]$workDir, [int]$index, [int]$total) {
-    $src = $item.File.FullName
-    $tmp = Join-Path $workDir ("vid_" + [guid]::NewGuid().ToString('N') + '.mp4')
-    $durBefore = Get-VideoDuration $src
+        if ($savingPct -lt $ctx.MinSaving) {
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            return [pscustomobject]@{
+                path = $src; kind = $item.Kind; before = $sizeBefore; after = $sizeBefore
+                saved_pct = 0; tool = $tool; seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1)
+                status = 'skipped-small-gain'
+            }
+        }
 
-    # pick parameters based on encoder
-    $encArgs = @()
-    if ($useGpu) {
-        $encArgs = @('-c:v', $encoder, '-preset', $P.nvPreset, '-cq', $P.cq, '-rc', 'constqp')
-        if ($Codec -eq 'av1') { $encArgs = @('-c:v', $encoder, '-preset', $P.nvPreset, '-cq', $P.cq) }
-    } else {
-        $encArgs = @('-c:v', $encoder, '-crf', $P.cpuCrf, '-preset', $P.cpuPreset)
-        if ($Codec -eq 'hevc') { $encArgs += @('-tag:v', 'hvc1') }
-    }
-
-    $argsList = @('-y', '-v', 'error', '-i', $src) + $encArgs + @('-c:a', 'copy', '-c:s', 'copy', '-map_metadata', '-1', '-movflags', '+faststart', $tmp)
-    & $FFMPEG @argsList 2>&1 | Out-Null
-
-    if (-not (Test-Path $tmp)) {
-        return @{ ok = $false; error = 'ffmpeg did not produce an output' }
-    }
-    # verify
-    if (-not (Test-VideoValid $tmp)) {
+        # backup + replace
+        if ($ctx.Backup) {
+            $rel = $src
+            if ($src.StartsWith($ctx.ScanRoot, [StringComparison]::OrdinalIgnoreCase)) {
+                $rel = $src.Substring($ctx.ScanRoot.Length).TrimStart('\', '/')
+            }
+            $dest = Join-Path $ctx.BackupDir $rel
+            $destDir = Split-Path $dest -Parent
+            if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+            Copy-Item -LiteralPath $src -Destination $dest -Force
+        }
+        Copy-Item -LiteralPath $tmp -Destination $src -Force
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        return @{ ok = $false; error = 'output failed to decode' }
-    }
-    $durAfter = Get-VideoDuration $tmp
-    if ($durBefore -gt 0 -and $durAfter -gt 0 -and [math]::Abs($durAfter - $durBefore) -gt 1.0) {
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-        return @{ ok = $false; error = "duration mismatch ($durBefore vs $durAfter)" }
-    }
-    $tool = "$encoder cq$($P.cq)" + $(if ($useGpu) { ' [GPU]' } else { ' [CPU]' })
-    return @{ ok = $true; outFile = $tmp; tool = $tool }
-}
 
-# ============================================================ main loop
-$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-$done = 0; $skipped = 0; $failed = 0
-$savedBytes = 0
-$processedBytes = 0
-$i = 0
+        return [pscustomobject]@{
+            path = $src; kind = $item.Kind; before = $sizeBefore; after = $sizeAfter
+            saved_pct = [math]::Round($savingPct, 1); tool = $tool; seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1)
+            status = 'ok'
+        }
 
-foreach ($item in $mediaFiles) {
-    $i++
-    $f = $item.File
-    $sizeBefore = $f.Length
-    $relName = if ($f.FullName.StartsWith($scanRoot, [StringComparison]::OrdinalIgnoreCase)) { $f.FullName.Substring($scanRoot.Length).TrimStart('\') } else { $f.Name }
-
-    # skip already processed
-    if ($history.ContainsKey($f.FullName)) {
-        $skipped++
-        Write-Skip ("[{0}/{1}] SKIP (already done): {2}" -f $i, $mediaFiles.Count, $relName)
-        continue
-    }
-
-    if ($WhatIf) {
-        Write-Info ("[{0}/{1}] Would compress: {2} ({3})" -f $i, $mediaFiles.Count, $relName, (Format-Size $sizeBefore))
-        continue
-    }
-
-    $fileWatch = [System.Diagnostics.Stopwatch]::StartNew()
-    $res = if ($item.Kind -eq 'image') { Compress-Image $item $script:TempDir } else { Compress-Video $item $script:TempDir $i $mediaFiles.Count }
-    $fileWatch.Stop()
-
-    if (-not $res.ok) {
-        $failed++
-        Write-Err ("[{0}/{1}] FAIL: {2} - {3}" -f $i, $mediaFiles.Count, $relName, $res.error)
-        $results.Add([pscustomobject]@{
-            path = $f.FullName; kind = $item.Kind; before = $sizeBefore; after = $sizeBefore
-            saved_pct = 0; tool = ''; seconds = [math]::Round($fileWatch.Elapsed.TotalSeconds, 1); status = "fail: $($res.error)"
-        })
-        continue
-    }
-
-    $sizeAfter = (Get-Item $res.outFile).Length
-    $savingPct = if ($sizeBefore -gt 0) { (1 - $sizeAfter / $sizeBefore) * 100 } else { 0 }
-
-    if ($savingPct -lt $MinSaving) {
-        $skipped++
-        Remove-Item $res.outFile -Force -ErrorAction SilentlyContinue
-        Write-Skip ("[{0}/{1}] SKIP (<{2}% saving): {3} ({4} -> {5})" -f $i, $mediaFiles.Count, $MinSaving, $relName, (Format-Size $sizeBefore), (Format-Size $sizeAfter))
-        $results.Add([pscustomobject]@{
-            path = $f.FullName; kind = $item.Kind; before = $sizeBefore; after = $sizeBefore
-            saved_pct = 0; tool = $res.tool; seconds = [math]::Round($fileWatch.Elapsed.TotalSeconds, 1); status = 'skipped-small-gain'
-        })
-        continue
-    }
-
-    # backup + replace
-    try {
-        if ($Backup) { Backup-Original $f.FullName $scanRoot }
-        Copy-Item -LiteralPath $res.outFile -Destination $f.FullName -Force
-        Remove-Item $res.outFile -Force -ErrorAction SilentlyContinue
-
-        $done++
-        $savedBytes += ($sizeBefore - $sizeAfter)
-        $processedBytes += $sizeBefore
-
-        $pctTotal = if ($totalBytesBefore -gt 0) { ($processedBytes / $totalBytesBefore) * 100 } else { 0 }
-        $eta = if ($processedBytes -gt 0) { ($stopwatch.Elapsed.TotalSeconds / $processedBytes) * ($totalBytesBefore - $processedBytes) } else { 0 }
-
-        Write-Ok ("[{0}/{1}] {2}  {3} -> {4}  (-{5:N0}%)  {6}  {7}" -f
-            $i, $mediaFiles.Count, $relName,
-            (Format-Size $sizeBefore), (Format-Size $sizeAfter), $savingPct,
-            $res.tool, (Format-Duration $fileWatch.Elapsed.TotalSeconds))
-        Write-Info ("    Overall: {0:N0}% | saved {1} | ETA ~{2}" -f $pctTotal, (Format-Size $savedBytes), (Format-Duration $eta))
-
-        $results.Add([pscustomobject]@{
-            path = $f.FullName; kind = $item.Kind; before = $sizeBefore; after = $sizeAfter
-            saved_pct = [math]::Round($savingPct, 1); tool = $res.tool; seconds = [math]::Round($fileWatch.Elapsed.TotalSeconds, 1); status = 'ok'
-        })
     } catch {
-        $failed++
-        Write-Err ("[{0}/{1}] FAIL while replacing: {2} - {3}" -f $i, $mediaFiles.Count, $relName, $_.Exception.Message)
-        Remove-Item $res.outFile -Force -ErrorAction SilentlyContinue
+        if ($tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+        return [pscustomobject]@{
+            path = $src; kind = $item.Kind; before = $sizeBefore; after = $sizeBefore
+            saved_pct = 0; tool = ''; seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1)
+            status = "fail: $($_.Exception.Message)"
+        }
+    } finally {
+        Update-Active $null
+        $watch.Stop()
     }
 }
 
-$stopwatch.Stop()
+# shared state (thread-safe)
+$state = [hashtable]::Synchronized(@{
+    Active = [hashtable]::Synchronized(@{})
+})
+
+$ctx = @{
+    FFMPEG = $FFMPEG; FFPROBE = $FFPROBE
+    OXIPNG = $OXIPNG; PNGQUANT = $PNGQUANT
+    JPEGTOOL = $JPEGTOOL; JPEGKIND = $JPEGKIND
+    TempDir = $script:TempDir; BackupDir = $script:BackupDir
+    Backup = [bool]$Backup; MinSaving = $MinSaving; ScanRoot = $scanRoot
+    useGpu = $useGpu; encoder = $encoder; Codec = $Codec
+    cq = $P.cq; nvPreset = $P.nvPreset; cpuCrf = $P.cpuCrf; cpuPreset = $P.cpuPreset
+    jpgQ = $P.jpgQ; pngQ = $P.pngQ
+}
+
+# ============================================================ runspace pools
+$pools = @()
+$pending = New-Object System.Collections.Generic.List[object]
+
+function Queue-Work([array]$queue, [int]$maxWorkers, [string]$poolName) {
+    if ($queue.Count -eq 0) { return }
+    $pool = [runspacefactory]::CreateRunspacePool(1, $maxWorkers)
+    $pool.ApartmentState = 'MTA'
+    $pool.Open()
+    $script:pools += $pool
+    foreach ($item in $queue) {
+        $ps = [powershell]::Create().AddScript($workerScript).AddArgument($item).AddArgument($ctx).AddArgument($state)
+        $ps.RunspacePool = $pool
+        $pending.Add(@{ PS = $ps; Async = $ps.BeginInvoke(); Item = $item })
+    }
+}
+
+try {
+    Queue-Work $vidQueue $VideoWorkers 'video'
+    Queue-Work $imgQueue $ImageWorkers 'image'
+
+    # ============================================================ progress UI
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $totalWork = $pending.Count
+    $totalWorkBytes = (($vidQueue + $imgQueue) | ForEach-Object { $_.File.Length } | Measure-Object -Sum).Sum
+    $results = New-Object System.Collections.Generic.List[object]
+    $doneCount = 0; $doneBytes = 0; $savedBytes = 0; $failCount = 0
+    $recent = New-Object 'System.Collections.Generic.Queue[string]'
+    $useCursorUI = -not [Console]::IsOutputRedirected
+    $statusTop = -1
+    $statusLines = 3 + [math]::Max($VideoWorkers, 1)
+
+    function Render-Status {
+        $pct = if ($totalWork -gt 0) { ($doneCount / $totalWork) * 100 } else { 100 }
+        $barLen = 24
+        $filled = [math]::Floor($barLen * $pct / 100)
+        $bar = ('#' * $filled).PadRight($barLen, '-')
+        $eta = if ($doneBytes -gt 0) { ($stopwatch.Elapsed.TotalSeconds / $doneBytes) * ($totalWorkBytes - $doneBytes) } else { 0 }
+
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add(("[{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4}  |  ETA {5}   " -f $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), (Format-Duration $eta)))
+        $activeSnapshot = @()
+        [System.Threading.Monitor]::Enter($state.SyncRoot)
+        try { $activeSnapshot = @($state.Active.Values | Select-Object -First ($statusLines - 3)) } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+        foreach ($a in $activeSnapshot) { $lines.Add(("  working: {0}   " -f $a)) }
+        for ($k = $activeSnapshot.Count; $k -lt ($statusLines - 3); $k++) { $lines.Add("") }
+        $recentText = if ($recent.Count -gt 0) { "  recent: " + (($recent.ToArray() | Select-Object -Last 2) -join '  |  ') } else { "" }
+        $lines.Add(($recentText + "   "))
+
+        if ($useCursorUI) {
+            try {
+                $w = [math]::Max(0, [Console]::WindowWidth - 1)
+                if ($statusTop -lt 0) {
+                    foreach ($l in $lines) { [Console]::WriteLine($l.PadRight($w)) }
+                    $statusTop = [Console]::CursorTop - $lines.Count
+                } else {
+                    [Console]::SetCursorPosition(0, $statusTop)
+                    foreach ($l in $lines) { [Console]::WriteLine($l.PadRight($w)) }
+                }
+                [Console]::Title = ("Optimize-Media {0:N0}% ({1}/{2})" -f $pct, $doneCount, $totalWork)
+            } catch {
+                $script:useCursorUI = $false
+                Write-Host $lines[0]
+            }
+        } else {
+            Write-Host $lines[0]
+        }
+    }
+
+    while ($pending.Count -gt 0) {
+        for ($i = $pending.Count - 1; $i -ge 0; $i--) {
+            $h = $pending[$i]
+            if ($h.Async.IsCompleted) {
+                $pending.RemoveAt($i)
+                try {
+                    $rOut = @($h.PS.EndInvoke($h.Async))
+                    $r = $rOut | Select-Object -Last 1
+                    if ($r) {
+                        $results.Add($r)
+                        $doneCount++
+                        $doneBytes += $r.before
+                        if ($r.status -eq 'ok') {
+                            $savedBytes += ($r.before - $r.after)
+                            $recent.Enqueue(("{0} -{1:N0}%" -f $r.path.Split('\')[-1], $r.saved_pct))
+                            while ($recent.Count -gt 4) { [void]$recent.Dequeue() }
+                        } elseif ($r.status -like 'fail*') {
+                            $failCount++
+                            $recent.Enqueue(("FAILED: {0}" -f $r.path.Split('\')[-1]))
+                            while ($recent.Count -gt 4) { [void]$recent.Dequeue() }
+                        }
+                    }
+                } catch {
+                    $failCount++
+                    $doneCount++
+                    $results.Add([pscustomobject]@{
+                        path = $h.Item.File.FullName; kind = $h.Item.Kind; before = $h.Item.File.Length; after = $h.Item.File.Length
+                        saved_pct = 0; tool = ''; seconds = 0; status = "fail: $($_.Exception.Message)"
+                    })
+                } finally {
+                    $h.PS.Dispose()
+                }
+            }
+        }
+        Render-Status
+        if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 250 }
+    }
+    $stopwatch.Stop()
+} finally {
+    foreach ($p in $pools) { $p.Close(); $p.Dispose() }
+    if ($useCursorUI -and $statusTop -ge 0) { [Console]::SetCursorPosition(0, $statusTop + $statusLines) }
+    [Console]::Title = "Optimize-Media - done"
+}
 
 # ============================================================ report
-if (-not $WhatIf -and $results.Count -gt 0) {
+$reportFile = Join-Path $script:LogDir ("report-" + (Get-Date -Format 'yyyyMMdd-HHmmss') + ".csv")
+if ($results.Count -gt 0) {
     $results | Export-Csv -LiteralPath $reportFile -NoTypeInformation -Encoding UTF8
-    # update history (only successfully compressed files) - append to existing file
     $okRows = $results | Where-Object { $_.status -eq 'ok' } | Select-Object @{n='path';e={$_.path}}, @{n='date';e={(Get-Date).ToString('s')}}
     if ($okRows) {
         $okRows | Export-Csv -LiteralPath $historyPath -NoTypeInformation -Encoding UTF8 -Append
@@ -408,29 +509,23 @@ Write-Host "`n==================================================" -ForegroundCol
 Write-Host "  RESULTS" -ForegroundColor Magenta
 Write-Host "==================================================" -ForegroundColor Magenta
 
-if ($WhatIf) {
-    Write-Host "WhatIf mode - nothing was compressed. Total: $($mediaFiles.Count) files, $(Format-Size $totalBytesBefore)"
-    if ($Host.Name -eq 'ConsoleHost' -and -not $env:OM_IGNORE_PAUSE) {
-        Write-Host "`nPress Enter to close..." -ForegroundColor Yellow
-        Read-Host | Out-Null
-    }
-    exit 0
+$okRes   = @($results | Where-Object { $_.status -eq 'ok' })
+$skipRes = @($results | Where-Object { $_.status -eq 'skipped-small-gain' })
+$failRes = @($results | Where-Object { $_.status -like 'fail*' })
+
+Write-Host ("  Compressed : {0} files" -f $okRes.Count)
+Write-Host ("  Skipped    : {0} files ({1} small-gain, {2} already done earlier)" -f ($skipRes.Count + $preSkipped), $skipRes.Count, $preSkipped)
+if ($failRes.Count -gt 0) {
+    Write-Host ("  Failed     : {0} files" -f $failRes.Count) -ForegroundColor Red
+    $failRes | Select-Object -First 5 | ForEach-Object { Write-Host ("    - {0}: {1}" -f $_.path.Split('\')[-1], $_.status) -ForegroundColor Red }
 }
-
-$afterBytes = $totalBytesBefore - $savedBytes
-$totalPct = if ($totalBytesBefore -gt 0) { ($savedBytes / $totalBytesBefore) * 100 } else { 0 }
-
-Write-Host ("  Compressed : {0} files" -f $done)
-Write-Host ("  Skipped    : {0} files" -f $skipped)
-if ($failed -gt 0) { Write-Host ("  Failed     : {0} files" -f $failed) -ForegroundColor Red }
 Write-Host ("  Before     : {0}" -f (Format-Size $totalBytesBefore))
-Write-Host ("  After      : {0}" -f (Format-Size $afterBytes))
-Write-Host ("  Saved      : {0}  ({1:N1}%)" -f (Format-Size $savedBytes), $totalPct) -ForegroundColor Green
-Write-Host ("  Time       : {0}" -f (Format-Duration $stopwatch.Elapsed.TotalSeconds))
+Write-Host ("  After      : {0}" -f (Format-Size ($totalBytesBefore - $savedBytes)))
+Write-Host ("  Saved      : {0}  ({1:N1}%)" -f (Format-Size $savedBytes), $(if ($totalBytesBefore -gt 0) { ($savedBytes / $totalBytesBefore) * 100 } else { 0 })) -ForegroundColor Green
+Write-Host ("  Time       : {0}  ({1:N0} MB/s processed)" -f (Format-Duration $stopwatch.Elapsed.TotalSeconds), $(if ($stopwatch.Elapsed.TotalSeconds -gt 0) { $doneBytes / 1MB / $stopwatch.Elapsed.TotalSeconds } else { 0 }))
 
-# breakdown by kind
 foreach ($k in @('image', 'video')) {
-    $rows = @($results | Where-Object { $_.kind -eq $k -and $_.status -eq 'ok' })
+    $rows = @($okRes | Where-Object { $_.kind -eq $k })
     if ($rows.Count -gt 0) {
         $b = ($rows | Measure-Object before -Sum).Sum
         $a = ($rows | Measure-Object after -Sum).Sum
@@ -444,7 +539,7 @@ foreach ($k in @('image', 'video')) {
 Write-Host "`nDetailed report: $reportFile" -ForegroundColor Cyan
 if ($Backup) { Write-Host "Originals backed up to: $script:BackupDir" -ForegroundColor Cyan }
 
-# keep the window open when launched by double-click (powershell.exe opens a new console)
+# keep the window open when launched by double-click
 if ($Host.Name -eq 'ConsoleHost' -and -not $env:OM_IGNORE_PAUSE) {
     Write-Host "`nPress Enter to close..." -ForegroundColor Yellow
     Read-Host | Out-Null
