@@ -12,12 +12,13 @@
     .\Optimize-Media.ps1 "\\NAS\share\path\to\media"
     .\Optimize-Media.ps1 "\\NAS\share\Photos" -Preset max -Backup
     .\Optimize-Media.ps1 "D:\Photos\img.jpg"
-    .\Optimize-Media.ps1 <path> -WhatIf        # scan and estimate only, no compression
+    .\Optimize-Media.ps1 "folder1" "folder2" "folder3"   # multiple folders in one run
+    .\Optimize-Media.ps1 <path...> -WhatIf          # scan and estimate only, no compression
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true, Position = 0)]
-    [string]$Path,
+    [Parameter(Position = 0)]
+    [string[]]$Path,
 
     [Parameter(Position = 1)]
     [ValidateSet('fast', 'balanced', 'max', 'archive')]
@@ -67,6 +68,57 @@ function Write-Info([string]$msg)  { Write-Host $msg -ForegroundColor Gray }
 function Write-Ok([string]$msg)    { Write-Host $msg -ForegroundColor Green }
 function Write-Warn2([string]$msg) { Write-Host $msg -ForegroundColor Yellow }
 function Write-Err([string]$msg)   { Write-Host $msg -ForegroundColor Red }
+
+# Windows toast (balloon) notification so the user is alerted even when the
+# console is backgrounded, plus a chime. Uses a real message pump for a
+# reliable balloon. On any failure it just flashes the console title.
+function Show-FinishedNotification {
+    param([string]$Title, [string]$Body)
+    try {
+        Add-Type -AssemblyName System.Windows.Forms | Out-Null
+        Add-Type -AssemblyName System.Drawing | Out-Null
+        $iconPath = [System.Environment]::GetFolderPath('System') + '\notepad.exe'
+        $notify = New-Object System.Windows.Forms.NotifyIcon
+        $notify.Icon = New-Object System.Drawing.Icon($iconPath)
+        $notify.Visible = $true
+        $notify.BalloonTipTitle = $Title
+        $notify.BalloonTipText  = $Body
+        $notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Info
+        $notify.ShowBalloonTip(10000)
+        # Pump Windows messages so the balloon actually renders for ~10s.
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($sw.Elapsed.TotalSeconds -lt 10) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 100
+        }
+        $notify.Dispose()
+        try { [System.Media.SystemSounds]::Asterisk.Play() } catch { }
+    } catch {
+        try { [Console]::Title = "Optimize-Media - FINISHED: $Title ($Body)" } catch { }
+    }
+}
+
+# Splits a raw string that may hold several paths into individual paths.
+# The .cmd wrapper joins paths with '|' (illegal in Windows filenames), so we
+# split on pipes first. Within each segment we also honor quoted grouped paths
+# (pasted '"a" "b"' into the prompt). Quotes are stripped.
+function Split-Paths([string]$raw) {
+    $out = @()
+    if (-not $raw) { return @($out) }
+    foreach ($seg in $raw -split '\|') {
+        if ($seg -eq '') { continue }
+        $matched = $false
+        foreach ($m in [regex]::Matches($seg, '"([^"]*)"')) {
+            $t = $m.Groups[1].Value.Trim()
+            if ($t -ne '') { $out += $t; $matched = $true }
+        }
+        if (-not $matched) {
+            $t = $seg.Trim().Trim('"', "'")
+            if ($t -ne '') { $out += $t }
+        }
+    }
+    return @($out)
+}
 
 # ============================================================ load config
 if (-not (Test-Path $script:ConfigPath)) {
@@ -134,34 +186,51 @@ Write-Host "  Workers: $ImageWorkers images + $VideoWorkers videos (parallel)" -
 Write-Host "==================================================" -ForegroundColor Magenta
 
 # ============================================================ collect files
-$Path = $Path.Trim().Trim('"', "'")
+$mediaFiles = @()
+$sourceRoots = @()
 
-if (-not (Test-Path -LiteralPath $Path)) {
-    Write-Err "Path not found: $Path"
+# Resolve the path list. A direct run with no arguments gets one friendly
+# prompt (no per-item Path[0]/Path[1] prompts), and pasted multiple quoted
+# paths are split correctly.
+$pathList = @()
+foreach ($entry in $Path) { $pathList += Split-Paths ([string]$entry) }
+if ($pathList.Count -eq 0) {
+    $line = Read-Host 'Enter path(s) - drag/paste folder paths, separated by spaces, each quoted'
+    $pathList = Split-Paths $line
+}
+if ($pathList.Count -eq 0) {
+    Write-Err "No path was given."
     exit 1
 }
-$inputItem = Get-Item -LiteralPath $Path
-if ($inputItem.PSIsContainer) {
-    $allFiles = @(Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue)
-    $scanRoot = $inputItem.FullName
-} else {
-    $allFiles = @($inputItem)
-    $scanRoot = $inputItem.DirectoryName
-}
 
-$mediaFiles = @()
-foreach ($f in $allFiles) {
-    $ext = $f.Extension.ToLower()
-    $isMedia = $script:ImageExt -contains $ext -or $script:VideoExt -contains $ext
-    if (-not $isMedia) { continue }
-    if ($Include -and ($Include | ForEach-Object { $_.ToLower().TrimStart('.') }) -notcontains $ext.TrimStart('.')) { continue }
-    if ($Exclude -and ($Exclude | ForEach-Object { $_.ToLower().TrimStart('.') }) -contains $ext.TrimStart('.')) { continue }
-    $kind = if ($script:ImageExt -contains $ext) { 'image' } else { 'video' }
-    $mediaFiles += [pscustomobject]@{ File = $f; Kind = $kind; Ext = $ext }
+foreach ($curPath in $pathList) {
+    if (-not (Test-Path -LiteralPath $curPath)) {
+        Write-Err "Path not found: $curPath"
+        exit 1
+    }
+    $inputItem = Get-Item -LiteralPath $curPath
+    if ($inputItem.PSIsContainer) {
+        $subFiles = @(Get-ChildItem -LiteralPath $curPath -Recurse -File -ErrorAction SilentlyContinue)
+        $root = $inputItem.FullName
+    } else {
+        $subFiles = @($inputItem)
+        $root = $inputItem.DirectoryName
+    }
+    $sourceRoots += $root
+
+    foreach ($f in $subFiles) {
+        $ext = $f.Extension.ToLower()
+        $isMedia = $script:ImageExt -contains $ext -or $script:VideoExt -contains $ext
+        if (-not $isMedia) { continue }
+        if ($Include -and ($Include | ForEach-Object { $_.ToLower().TrimStart('.') }) -notcontains $ext.TrimStart('.')) { continue }
+        if ($Exclude -and ($Exclude | ForEach-Object { $_.ToLower().TrimStart('.') }) -contains $ext.TrimStart('.')) { continue }
+        $kind = if ($script:ImageExt -contains $ext) { 'image' } else { 'video' }
+        $mediaFiles += [pscustomobject]@{ File = $f; Kind = $kind; Ext = $ext; Root = $root }
+    }
 }
 
 if ($mediaFiles.Count -eq 0) {
-    Write-Err "No image/video files found in: $Path"
+    Write-Err "No image/video files found in: $($sourceRoots -join '; ')"
     exit 1
 }
 
@@ -169,7 +238,7 @@ $totalBytesBefore = ($mediaFiles | ForEach-Object { $_.File.Length } | Measure-O
 $nImg = @($mediaFiles | Where-Object Kind -eq 'image').Count
 $nVid = @($mediaFiles | Where-Object Kind -eq 'video').Count
 Write-Host "Scanned: $($mediaFiles.Count) files ($nImg images, $nVid videos) - $(Format-Size $totalBytesBefore)" -ForegroundColor Cyan
-Write-Info "Source: $scanRoot"
+Write-Info "Source: $($sourceRoots -join '; ')"
 
 # ============================================================ history (skip already-processed files)
 $historyPath = Join-Path $script:LogDir 'history.csv'
@@ -201,6 +270,7 @@ if ($WhatIf) {
 
 if (($imgQueue.Count + $vidQueue.Count) -eq 0) {
     Write-Ok "Nothing to do - every file was already processed."
+    Show-FinishedNotification -Title "Optimize-Media finished" -Body "Nothing to do - every file was already processed."
     exit 0
 }
 
@@ -349,8 +419,8 @@ $workerScript = {
         # backup + replace
         if ($ctx.Backup) {
             $rel = $src
-            if ($src.StartsWith($ctx.ScanRoot, [StringComparison]::OrdinalIgnoreCase)) {
-                $rel = $src.Substring($ctx.ScanRoot.Length).TrimStart('\', '/')
+            if ($src.StartsWith($item.Root, [StringComparison]::OrdinalIgnoreCase)) {
+                $rel = $src.Substring($item.Root.Length).TrimStart('\', '/')
             }
             $dest = Join-Path $ctx.BackupDir $rel
             $destDir = Split-Path $dest -Parent
@@ -404,7 +474,7 @@ $ctx = @{
     OXIPNG = $OXIPNG; PNGQUANT = $PNGQUANT
     JPEGTOOL = $JPEGTOOL; JPEGKIND = $JPEGKIND
     TempDir = $script:TempDir; BackupDir = $script:BackupDir
-    Backup = [bool]$Backup; MinSaving = $MinSaving; ScanRoot = $scanRoot
+    Backup = [bool]$Backup; MinSaving = $MinSaving
     useGpu = $useGpu; encoder = $encoder; Codec = $Codec
     cq = $P.cq; nvPreset = $P.nvPreset; cpuCrf = $P.cpuCrf; cpuPreset = $P.cpuPreset
     jpgQ = $P.jpgQ; pngQ = $P.pngQ
@@ -432,51 +502,88 @@ try {
     Queue-Work $imgQueue $ImageWorkers 'image'
 
     # ============================================================ progress UI
+    # A single-line live progress bar (OVERWRITTEN in place when the console
+    # supports it, otherwise a throttled short line). No more multi-line spam.
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $totalWork = $pending.Count
     $totalWorkBytes = (($vidQueue + $imgQueue) | ForEach-Object { $_.File.Length } | Measure-Object -Sum).Sum
     $results = New-Object System.Collections.Generic.List[object]
     $doneCount = 0; $doneBytes = 0; $savedBytes = 0; $failCount = 0
     $recent = New-Object 'System.Collections.Generic.Queue[string]'
-    $useCursorUI = -not [Console]::IsOutputRedirected
-    $statusTop = -1
-    $statusLines = 3 + [math]::Max($VideoWorkers, 1)
 
-    function Render-Status {
-        $pct = if ($totalWork -gt 0) { ($doneCount / $totalWork) * 100 } else { 100 }
+    # Cursor UI is used only when we can actually repaint in place.
+    $useCursorUI = $false
+    if (-not [Console]::IsOutputRedirected) {
+        try { [void][Console]::CursorLeft; $useCursorUI = $true } catch { $useCursorUI = $false }
+    }
+    $statusTop = -1
+    $statusLines = 1
+    $lastBlob = ''
+    $lastTick = 0
+    $script:fallbackMode = $false
+
+    function Clip-Text([string]$s) {
+        if ($null -eq $s) { return '' }
+        $w = try { [Math]::Max(30, [Console]::WindowWidth - 1) } catch { 120 }
+        if ($s.Length -gt $w) { $s = $s.Substring(0, $w - 1) + '~' }
+        return $s
+    }
+
+    function Render-Status([bool]$force = $false) {
+        $pct    = if ($totalWork -gt 0) { ($doneCount / $totalWork) * 100 } else { 100 }
         $barLen = 24
         $filled = [math]::Floor($barLen * $pct / 100)
-        $bar = ('#' * $filled).PadRight($barLen, '-')
-        $eta = if ($doneBytes -gt 0) { ($stopwatch.Elapsed.TotalSeconds / $doneBytes) * ($totalWorkBytes - $doneBytes) } else { 0 }
+        $bar    = ('#' * $filled).PadRight($barLen, '-')
+        $eta    = if ($doneBytes -gt 0) { ($stopwatch.Elapsed.TotalSeconds / $doneBytes) * ($totalWorkBytes - $doneBytes) } else { 0 }
+        $savedP = if ($totalBytesBefore -gt 0) { ($savedBytes / $totalBytesBefore) * 100 } else { 0 }
 
-        $lines = New-Object System.Collections.Generic.List[string]
-        $lines.Add(("[{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4}  |  ETA {5}   " -f $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), (Format-Duration $eta)))
-        $activeSnapshot = @()
+        $active = @()
         [System.Threading.Monitor]::Enter($state.SyncRoot)
-        try { $activeSnapshot = @($state.Active.Values | Select-Object -First ($statusLines - 3)) } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
-        foreach ($a in $activeSnapshot) { $lines.Add(("  working: {0}   " -f $a)) }
-        for ($k = $activeSnapshot.Count; $k -lt ($statusLines - 3); $k++) { $lines.Add("") }
-        $recentText = if ($recent.Count -gt 0) { "  recent: " + (($recent.ToArray() | Select-Object -Last 2) -join '  |  ') } else { "" }
-        $lines.Add(($recentText + "   "))
+        try { $active = @($state.Active.Values) } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+        $working = if ($active.Count) { ($active -join ', ') } else { 'idle' }
+        if ($working.Length -gt 90) { $working = $working.Substring(0, 87) + '...' }
+
+        $line1 = ("[{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4} ({5:N0}%)  |  ETA {6}" -f
+            $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), $savedP, (Format-Duration $eta))
 
         if ($useCursorUI) {
+            $blob = $line1 + "`n  now: $working"
+            if (-not $force -and $blob -eq $lastBlob) { return }
+            $lastBlob = $blob   # skip repaints when nothing changed
             try {
-                $w = [math]::Max(0, [Console]::WindowWidth - 1)
+                $w = [Math]::Max(0, [Console]::WindowWidth - 1)
                 if ($statusTop -lt 0) {
-                    foreach ($l in $lines) { [Console]::WriteLine($l.PadRight($w)) }
-                    $statusTop = [Console]::CursorTop - $lines.Count
+                    [Console]::WriteLine((Clip-Text $line1).PadRight($w))
+                    [Console]::WriteLine((Clip-Text ("  now: $working")).PadRight($w))
+                    $statusTop = [Console]::CursorTop - 2
+                    $statusLines = 2
                 } else {
                     [Console]::SetCursorPosition(0, $statusTop)
-                    foreach ($l in $lines) { [Console]::WriteLine($l.PadRight($w)) }
+                    [Console]::WriteLine((Clip-Text $line1).PadRight($w))
+                    [Console]::WriteLine((Clip-Text ("  now: $working")).PadRight($w))
                 }
                 [Console]::Title = ("Optimize-Media {0:N0}% ({1}/{2})" -f $pct, $doneCount, $totalWork)
+                return
             } catch {
                 $script:useCursorUI = $false
-                Write-Host $lines[0]
             }
-        } else {
-            Write-Host $lines[0]
         }
+
+        # Fallback: overwrite the SAME line in place with \r so the terminal
+        # never scrolls with duplicate progress lines (a single moving bar).
+        if (-not $force) {
+            $nowTick = [int]$stopwatch.Elapsed.TotalSeconds
+            if ($nowTick -le $lastTick) { return }
+            $lastTick = $nowTick
+        }
+        $w = try { [Math]::Max(0, [Console]::WindowWidth - 1) } catch { 120 }
+        $padded = (Clip-Text ("  {0}  |  now: {1}" -f $line1, $working)).PadRight($w)
+        try {
+            [Console]::Out.Write("`r" + $padded)
+        } catch {
+            [Console]::Out.Write(("`r" + $padded + "`n"))
+        }
+        $script:fallbackMode = $true
     }
 
     while ($pending.Count -gt 0) {
@@ -516,10 +623,18 @@ try {
         Render-Status
         if ($pending.Count -gt 0) { Start-Sleep -Milliseconds 250 }
     }
+    Render-Status $true
     $stopwatch.Stop()
 } finally {
     foreach ($p in $pools) { $p.Close(); $p.Dispose() }
-    if ($useCursorUI -and $statusTop -ge 0) { [Console]::SetCursorPosition(0, $statusTop + $statusLines) }
+    if ($useCursorUI -and $statusTop -ge 0) {
+        try {
+            $w = [math]::Max(0, [Console]::WindowWidth - 1)
+            [Console]::SetCursorPosition(0, $statusTop)
+            foreach ($i in 1..$statusLines) { [Console]::WriteLine(''.PadRight($w)) }
+            [Console]::SetCursorPosition(0, $statusTop)
+        } catch { }
+    }
     [Console]::Title = "Optimize-Media - done"
 }
 
@@ -547,10 +662,22 @@ if ($failRes.Count -gt 0) {
     Write-Host ("  Failed     : {0} files" -f $failRes.Count) -ForegroundColor Red
     $failRes | Select-Object -First 5 | ForEach-Object { Write-Host ("    - {0}: {1}" -f $_.path.Split('\')[-1], $_.status) -ForegroundColor Red }
 }
+Write-Host ""
+$after  = $totalBytesBefore - $savedBytes
+$overall= if ($totalBytesBefore -gt 0) { ($savedBytes / $totalBytesBefore) * 100 } else { 0 }
 Write-Host ("  Before     : {0}" -f (Format-Size $totalBytesBefore))
-Write-Host ("  After      : {0}" -f (Format-Size ($totalBytesBefore - $savedBytes)))
-Write-Host ("  Saved      : {0}  ({1:N1}%)" -f (Format-Size $savedBytes), $(if ($totalBytesBefore -gt 0) { ($savedBytes / $totalBytesBefore) * 100 } else { 0 })) -ForegroundColor Green
-Write-Host ("  Time       : {0}  ({1:N0} MB/s processed)" -f (Format-Duration $stopwatch.Elapsed.TotalSeconds), $(if ($stopwatch.Elapsed.TotalSeconds -gt 0) { $doneBytes / 1MB / $stopwatch.Elapsed.TotalSeconds } else { 0 }))
+Write-Host ("  After      : {0}" -f (Format-Size $after))
+Write-Host ("  Saved      : {0}  ({1:N1}%)" -f (Format-Size $savedBytes), $overall) -ForegroundColor Green
+
+$bestSize = $okRes | Sort-Object { $_.before - $_.after } -Descending | Select-Object -First 1
+$bestPct  = $okRes | Sort-Object saved_pct -Descending | Select-Object -First 1
+if ($bestSize) {
+    Write-Host ("  Best size  : {0}  (-{1})" -f $bestSize.path.Split('\')[-1], (Format-Size ($bestSize.before - $bestSize.after)))
+}
+if ($bestPct) {
+    Write-Host ("  Best %     : {0}  (-{1:N1}%)" -f $bestPct.path.Split('\')[-1], $bestPct.saved_pct)
+}
+Write-Host ("  Time       : {0}" -f (Format-Duration $stopwatch.Elapsed.TotalSeconds))
 
 foreach ($k in @('image', 'video')) {
     $rows = @($okRes | Where-Object { $_.kind -eq $k })
@@ -566,6 +693,9 @@ foreach ($k in @('image', 'video')) {
 
 Write-Host "`nDetailed report: $reportFile" -ForegroundColor Cyan
 if ($Backup) { Write-Host "Originals backed up to: $script:BackupDir" -ForegroundColor Cyan }
+
+# Alert the user the job is done, even if the window is in the background.
+Show-FinishedNotification -Title "Optimize-Media finished" -Body ("{0} files done, saved {1} ({2:N0}%) in {3}" -f $okRes.Count, (Format-Size $savedBytes), $overall, (Format-Duration $stopwatch.Elapsed.TotalSeconds))
 
 # keep the window open when launched by double-click
 if ($Host.Name -eq 'ConsoleHost' -and -not $env:OM_IGNORE_PAUSE) {
