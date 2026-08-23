@@ -11,6 +11,7 @@ Compress images and videos on Windows with the best possible quality-to-size rat
 - **GPU-accelerated video** — HEVC/AV1 encoding via NVIDIA NVENC (auto-detected), falls back to CPU (x265/x264) when unavailable
 - **Smart image compression** — lossless first (jpegoptim, oxipng), light lossy only when it saves meaningfully (pngquant)
 - **Safe by design** — compresses to a local temp file, verifies the output (full decode + duration check), only replaces the original when it's smaller and valid
+- **Metadata preserved** — EXIF (date taken, GPS, camera), video container tags (recording date, title), and file Created/Modified dates all survive compression
 - **Keeps formats** — `.mp4` stays `.mp4`, `.jpg` stays `.jpg`; nothing breaks
 - **SMB aware** — works directly on UNC paths, copies results back only after local verification
 - **Resumable** — a processing history means re-runs skip already-compressed files

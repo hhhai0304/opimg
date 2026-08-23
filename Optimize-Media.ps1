@@ -243,8 +243,9 @@ $workerScript = {
             switch -Regex ($ext) {
                 '\.jpe?g$' {
                     if ($ctx.JPEGTOOL -and $ctx.JPEGKIND -eq 'jpegoptim') {
-                        & $ctx.JPEGTOOL --strip-all --all-progressive $tmp 2>&1 | Out-Null
-                        $tool = 'jpegoptim-lossless'
+                        # lossless re-compress, KEEP all EXIF (date taken, GPS, camera info)
+                        & $ctx.JPEGTOOL --keep-all --all-progressive $tmp 2>&1 | Out-Null
+                        $tool = 'jpegoptim-lossless+exif'
                     } elseif ($ctx.JPEGTOOL) {
                         $tmpOut = "$tmp.out.jpg"
                         & $ctx.JPEGTOOL -quality $ctx.jpgQ -optimize -progressive -outfile $tmpOut $tmp 2>&1 | Out-Null
@@ -252,7 +253,7 @@ $workerScript = {
                         $tool = "mozjpeg-q$($ctx.jpgQ)"
                     } else {
                         $tmpOut = "$tmp.out.jpg"
-                        & $ctx.FFMPEG -y -v error -i $tmp -c:v mjpeg -q:v 2 -map_metadata -1 $tmpOut 2>&1 | Out-Null
+                        & $ctx.FFMPEG -y -v error -i $tmp -c:v mjpeg -q:v 2 $tmpOut 2>&1 | Out-Null
                         if (Test-Path $tmpOut) { Move-Item $tmpOut $tmp -Force }
                         $tool = 'ffmpeg-mjpeg'
                     }
@@ -264,7 +265,7 @@ $workerScript = {
                     }
                     if ($ctx.PNGQUANT -and (Get-Item $tmp).Length -gt 200KB) {
                         $tmpQ = "$tmp.q.png"
-                        & $ctx.PNGQUANT --quality=$($ctx.pngQ) --speed 1 --strip --force --output $tmpQ $tmp 2>&1 | Out-Null
+                        & $ctx.PNGQUANT --quality=$($ctx.pngQ) --speed 1 --force --output $tmpQ $tmp 2>&1 | Out-Null
                         if ((Test-Path $tmpQ) -and ((Get-Item $tmpQ).Length -lt (Get-Item $tmp).Length * 0.92)) {
                             Move-Item $tmpQ $tmp -Force
                             $tool = "oxipng+pngquant($($ctx.pngQ))"
@@ -275,19 +276,19 @@ $workerScript = {
                 }
                 '\.gif$' {
                     $tmpOut = "$tmp.out.gif"
-                    & $ctx.FFMPEG -y -v error -i $tmp -map_metadata -1 $tmpOut 2>&1 | Out-Null
+                    & $ctx.FFMPEG -y -v error -i $tmp $tmpOut 2>&1 | Out-Null
                     if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
                     $tool = 'ffmpeg-gif'
                 }
                 '\.webp$' {
                     $tmpOut = "$tmp.out.webp"
-                    & $ctx.FFMPEG -y -v error -i $tmp -c:v libwebp -quality 85 -map_metadata -1 $tmpOut 2>&1 | Out-Null
+                    & $ctx.FFMPEG -y -v error -i $tmp -c:v libwebp -quality 85 $tmpOut 2>&1 | Out-Null
                     if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
                     $tool = 'libwebp-q85'
                 }
                 default {
                     $tmpOut = "$tmp.out$ext"
-                    & $ctx.FFMPEG -y -v error -i $tmp -map_metadata -1 $tmpOut 2>&1 | Out-Null
+                    & $ctx.FFMPEG -y -v error -i $tmp $tmpOut 2>&1 | Out-Null
                     if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
                     $tool = 'ffmpeg'
                 }
@@ -300,6 +301,14 @@ $workerScript = {
             $tmp = Join-Path $ctx.TempDir ("vid_" + [guid]::NewGuid().ToString('N') + '.mp4')
             $durBefore = Get-VideoDuration $src
 
+            # capture container metadata from the ORIGINAL (NVENC does not carry creation_time over)
+            $origMeta = @{}
+            try {
+                $tagsJson = & $ctx.FFPROBE -v error -show_entries format_tags -of json $src 2>&1 | Out-String
+                $tags = ($tagsJson | ConvertFrom-Json).format.tags
+                if ($tags) { $tags.PSObject.Properties | ForEach-Object { $origMeta[$_.Name] = $_.Value } }
+            } catch { }
+
             $encArgs = @()
             if ($ctx.useGpu) {
                 $encArgs = @('-c:v', $ctx.encoder, '-preset', $ctx.nvPreset, '-cq', $ctx.cq, '-rc', 'constqp')
@@ -310,7 +319,11 @@ $workerScript = {
             }
             $tool = "$($ctx.encoder) cq$($ctx.cq)" + $(if ($ctx.useGpu) { ' [GPU]' } else { ' [CPU]' })
 
-            $argsList = @('-y', '-v', 'error', '-i', $src) + $encArgs + @('-c:a', 'copy', '-c:s', 'copy', '-map_metadata', '-1', '-movflags', '+faststart', $tmp)
+            # re-apply original container metadata (recording date, title...) after the encoder args
+            $metaArgs = @()
+            foreach ($k in $origMeta.Keys) { $metaArgs += @('-metadata', "$k=$($origMeta[$k])") }
+
+            $argsList = @('-y', '-v', 'error', '-i', $src) + $encArgs + @('-c:a', 'copy', '-c:s', 'copy', '-movflags', '+faststart') + $metaArgs + @($tmp)
             & $ctx.FFMPEG @argsList 2>&1 | Out-Null
 
             if (-not (Test-Path $tmp)) { throw 'ffmpeg did not produce an output' }
@@ -344,8 +357,23 @@ $workerScript = {
             if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
             Copy-Item -LiteralPath $src -Destination $dest -Force
         }
+        # capture original file timestamps before overwriting
+        $origTimes = $null
+        try {
+            $origItem = Get-Item -LiteralPath $src -Force
+            $origTimes = @{ c = $origItem.CreationTime; w = $origItem.LastWriteTime; a = $origItem.LastAccessTime }
+        } catch { }
         Copy-Item -LiteralPath $tmp -Destination $src -Force
         Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        # restore original timestamps (copy resets Created date otherwise)
+        if ($origTimes) {
+            try {
+                $newItem = Get-Item -LiteralPath $src -Force
+                $newItem.CreationTime   = $origTimes.c
+                $newItem.LastWriteTime  = $origTimes.w
+                $newItem.LastAccessTime = $origTimes.a
+            } catch { }
+        }
 
         return [pscustomobject]@{
             path = $src; kind = $item.Kind; before = $sizeBefore; after = $sizeAfter
