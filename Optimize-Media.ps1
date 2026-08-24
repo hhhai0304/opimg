@@ -104,7 +104,7 @@ function Show-FinishedNotification {
 # (pasted '"a" "b"' into the prompt). Quotes are stripped.
 function Split-Paths([string]$raw) {
     $out = @()
-    if (-not $raw) { return @($out) }
+    if (-not $raw) { return ,$out }
     foreach ($seg in $raw -split '\|') {
         if ($seg -eq '') { continue }
         $matched = $false
@@ -117,7 +117,7 @@ function Split-Paths([string]$raw) {
             if ($t -ne '') { $out += $t }
         }
     }
-    return @($out)
+    return ,$out
 }
 
 # ============================================================ load config
@@ -193,10 +193,10 @@ $sourceRoots = @()
 # prompt (no per-item Path[0]/Path[1] prompts), and pasted multiple quoted
 # paths are split correctly.
 $pathList = @()
-foreach ($entry in $Path) { $pathList += Split-Paths ([string]$entry) }
+foreach ($entry in $Path) { $pathList += @(Split-Paths ([string]$entry)) }
 if ($pathList.Count -eq 0) {
     $line = Read-Host 'Enter path(s) - drag/paste folder paths, separated by spaces, each quoted'
-    $pathList = Split-Paths $line
+    $pathList = @(Split-Paths $line)
 }
 if ($pathList.Count -eq 0) {
     Write-Err "No path was given."
