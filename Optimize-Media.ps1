@@ -98,24 +98,44 @@ function Show-FinishedNotification {
     }
 }
 
-# Splits a raw string that may hold several paths into individual paths.
-# The .cmd wrapper joins paths with '|' (illegal in Windows filenames), so we
-# split on pipes first. Within each segment we also honor quoted grouped paths
-# (pasted '"a" "b"' into the prompt). Quotes are stripped.
-function Split-Paths([string]$raw) {
+# Argument channel (direct invocation, and the .cmd wrapper).
+# PowerShell has already tokenized the command line, so each $Path element is
+# exactly one path - spaces intact, quotes stripped. The only extra case is the
+# .cmd wrapper, which joins whole paths with '|' (illegal in Windows filenames);
+# those segments are complete paths and must NOT be split on whitespace.
+function Expand-PathArg([string]$entry) {
+    $out = @()
+    if (-not $entry) { return ,$out }
+    foreach ($seg in $entry -split '\|') {
+        $t = $seg.Trim().Trim('"', "'")
+        if ($t -ne '') { $out += $t }
+    }
+    return ,$out
+}
+
+# Prompt channel (Read-Host): one raw line typed or pasted by the user.
+# Explorer quotes only names that contain spaces, so a single line routinely
+# mixes quoted and bare paths - both forms must survive.
+# When the line contains no quotes at all we treat it as ONE path, so a manually
+# typed unquoted path with spaces (C:\my photos) still works.
+function Split-PathLine([string]$raw) {
     $out = @()
     if (-not $raw) { return ,$out }
-    foreach ($seg in $raw -split '\|') {
-        if ($seg -eq '') { continue }
-        $matched = $false
-        foreach ($m in [regex]::Matches($seg, '"([^"]*)"')) {
-            $t = $m.Groups[1].Value.Trim()
-            if ($t -ne '') { $out += $t; $matched = $true }
-        }
-        if (-not $matched) {
-            $t = $seg.Trim().Trim('"', "'")
-            if ($t -ne '') { $out += $t }
-        }
+    $raw = $raw.Trim()
+    if ($raw -eq '') { return ,$out }
+
+    # No quotes anywhere: the whole line is a single path.
+    if ($raw -notmatch '"') {
+        $out += $raw.Trim("'")
+        return ,$out
+    }
+
+    # Mixed line: quoted runs are one path each, bare runs are whitespace
+    # separated (Explorer never leaves a spaced name unquoted).
+    foreach ($m in [regex]::Matches($raw, '"([^"]*)"|([^"\s]+)')) {
+        $t = if ($m.Groups[1].Success) { $m.Groups[1].Value } else { $m.Groups[2].Value }
+        $t = $t.Trim()
+        if ($t -ne '') { $out += $t }
     }
     return ,$out
 }
@@ -193,11 +213,13 @@ $sourceRoots = @()
 # prompt (no per-item Path[0]/Path[1] prompts), and pasted multiple quoted
 # paths are split correctly.
 $pathList = @()
-foreach ($entry in $Path) { $pathList += @(Split-Paths ([string]$entry)) }
+foreach ($entry in $Path) { $pathList += @(Expand-PathArg ([string]$entry)) }
 if ($pathList.Count -eq 0) {
-    $line = Read-Host 'Enter path(s) - drag/paste folder paths, separated by spaces, each quoted'
-    $pathList = @(Split-Paths $line)
+    $line = Read-Host 'Enter path(s) - drag/paste one or more folders (quote any name containing spaces)'
+    $pathList = @(Split-PathLine $line)
 }
+Write-Host ("Resolved {0} input path(s):" -f $pathList.Count)
+$pathList | ForEach-Object { Write-Host "  - $_" }
 if ($pathList.Count -eq 0) {
     Write-Err "No path was given."
     exit 1

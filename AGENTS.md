@@ -30,6 +30,21 @@ CLI tool to compress images and videos optimally on Windows, with SMB/network pa
 
 Or drag-and-drop a folder onto `Optimize-Media.cmd`.
 
+## Input channels
+
+`Optimize-Media.ps1` accepts paths through three channels that tokenize
+differently. Any change to path parsing must be verified against all three.
+
+| Channel | Example | What reaches the script | Rule |
+|---|---|---|---|
+| Argument | `.\Optimize-Media.ps1 "part 1" "part 2"` | `$Path = @('part 1','part 2')`, quotes already stripped | Do not split further (`Expand-PathArg`) |
+| `.cmd` wrapper | drag-drop onto `Optimize-Media.cmd` | `-Path "a\|b"` — one string joined with `\|` | Split on `\|` only (`Expand-PathArg`) |
+| `Read-Host` prompt | run with no args, then paste | one raw line: `"a 1" b2` | Split on quotes AND whitespace (`Split-PathLine`) |
+
+`$Path` must stay non-mandatory. Marking a `[string[]]` parameter `Mandatory`
+makes PowerShell prompt element-by-element (`Path[0]:`, `Path[1]:`), which is
+exactly the UX this script avoids.
+
 ## Files
 
 - `setup.ps1` — one-time tool installer (ffmpeg, oxipng, pngquant, jpegoptim); auto-runs the benchmark
