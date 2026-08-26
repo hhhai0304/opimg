@@ -689,17 +689,22 @@ try {
     Queue-Work $imgQueue $ImageWorkers 'image'
 
     # ============================================================ progress UI
-    # A single-line live progress bar, OVERWRITTEN in place with \r. State
-    # variables live in $script: scope so they persist across calls (plain
-    # assignments inside a function would create throwaway locals).
+    # Two-line live status, OVERWRITTEN in place (line 1: progress bar,
+    # line 2: files being processed). State variables live in $script:
+    # scope so they persist across calls - plain assignments inside a
+    # function would create throwaway locals. When the console cannot
+    # repaint in place it degrades to a single-line \r overwrite.
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $totalWork = $pending.Count
     $totalWorkBytes = (($vidQueue + $imgQueue) | ForEach-Object { $_.File.Length } | Measure-Object -Sum).Sum
     $results = New-Object System.Collections.Generic.List[object]
     $doneCount = 0; $doneBytes = 0; $savedBytes = 0; $failCount = 0
 
-    $script:lastLine = ''
+    $script:lastBar = ''
+    $script:lastNow = ''
     $script:lastTick = -1
+    $script:useTwoLine = $true
+    $script:statusTop = -1
 
     function Clip-Text([string]$s) {
         if ($null -eq $s) { return '' }
@@ -747,33 +752,58 @@ try {
         }
         $labels = @($labels | Sort-Object)
         $working = if ($labels.Count) { ($labels -join ', ') } else { 'idle' }
-        if ($working.Length -gt 70) { $working = $working.Substring(0, 67) + '...' }
+        if ($working.Length -gt 110) { $working = $working.Substring(0, 107) + '...' }
 
-        $line = Clip-Text ("  [{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4} ({5:N0}%)  |  ETA {6}  |  now: {7}" -f
-            $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), $savedP, (Format-Duration $eta), $working)
+        # line 1: counters, line 2: what is running right now
+        $barLine = Clip-Text ("  [{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4} ({5:N0}%)  |  ETA {6}" -f
+            $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), $savedP, (Format-Duration $eta))
+        $nowLine = Clip-Text ("    now: {0}" -f $working)
 
         # skip redraw when nothing changed (except the forced final render)
-        $changed = $line -ne $script:lastLine
-        if ($changed) { $script:lastLine = $line }
+        $changed = ($barLine -ne $script:lastBar) -or ($nowLine -ne $script:lastNow) -or $force
+        if (-not $changed) { return }
+        $script:lastBar = $barLine
+        $script:lastNow = $nowLine
 
         if ([Console]::IsOutputRedirected) {
             # cannot overwrite lines when output is redirected: print at most
-            # one line per second, and never repeat an identical line
-            if (-not $changed) { return }
-            $tick = [int]$stopwatch.Elapsed.TotalSeconds
+            # one combined line per second, and never repeat an identical line
             if (-not $force) {
+                $tick = [int]$stopwatch.Elapsed.TotalSeconds
                 if ($tick -le $script:lastTick) { return }
                 $script:lastTick = $tick
             }
-            [Console]::Out.WriteLine($line)
+            [Console]::Out.WriteLine("$barLine  |  now: $working")
             return
         }
 
+        if ($script:useTwoLine) {
+            try {
+                $w = [Math]::Max(0, [Console]::WindowWidth - 1)
+                if ($script:statusTop -lt 0) {
+                    [Console]::Out.WriteLine($barLine.PadRight($w))
+                    [Console]::Out.WriteLine($nowLine.PadRight($w))
+                    try { $script:statusTop = [Console]::CursorTop - 2 } catch { $script:statusTop = -1; $script:useTwoLine = $false }
+                } else {
+                    [Console]::SetCursorPosition(0, $script:statusTop)
+                    [Console]::Out.WriteLine($barLine.PadRight($w))
+                    [Console]::Out.WriteLine($nowLine.PadRight($w))
+                }
+                return
+            } catch {
+                # console scrolled or resized out from under us -> single-line mode
+                $script:useTwoLine = $false
+                $script:statusTop = -1
+            }
+        }
+
+        # single-line fallback: progress bar and current file share one line
+        $combined = Clip-Text ("$barLine  |  now: $working")
         try {
             $w = [Math]::Max(0, [Console]::WindowWidth - 1)
-            [Console]::Out.Write("`r" + $line.PadRight($w))
+            [Console]::Out.Write("`r" + $combined.PadRight($w))
         } catch {
-            [Console]::Out.Write("`r" + $line)
+            [Console]::Out.Write("`r" + $combined)
         }
         if ($force) { [Console]::Out.Write("`n") }
     }
