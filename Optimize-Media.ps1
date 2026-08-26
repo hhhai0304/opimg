@@ -13,6 +13,7 @@
     .\Optimize-Media.ps1 "\\NAS\share\Photos" -Preset max -Backup
     .\Optimize-Media.ps1 "D:\Photos\img.jpg"
     .\Optimize-Media.ps1 "folder1" "folder2" "folder3"   # multiple folders in one run
+    .\Optimize-Media.ps1 <path...> -AV1              # force AV1 video encoding (needs RTX 40xx for GPU speed)
     .\Optimize-Media.ps1 <path...> -WhatIf          # scan and estimate only, no compression
 #>
 [CmdletBinding()]
@@ -26,6 +27,9 @@ param(
 
     [ValidateSet('hevc', 'h264', 'av1')]
     [string]$Codec,
+
+    # shorthand for -Codec av1
+    [switch]$AV1,
 
     [switch]$Backup,
     [switch]$WhatIf,
@@ -185,6 +189,12 @@ $PRESETS = @{
 }
 $P = $PRESETS[$Preset]
 
+# codec resolution: -Codec/-AV1 flags > machine default from config.json > preset
+if ($AV1) { $Codec = 'av1' }
+if (-not $Codec) {
+    $cfgCodecProp = $cfg.PSObject.Properties['codec']
+    if ($cfgCodecProp -and @('hevc', 'h264', 'av1') -contains $cfgCodecProp.Value) { $Codec = [string]$cfgCodecProp.Value }
+}
 if (-not $Codec) {
     $Codec = switch ($Preset) {
         'archive' { 'h264' }
@@ -199,6 +209,9 @@ $encMap = @{
 }
 $useGpu = $HAS_NVENC -and ($Codec -ne 'av1' -or $HAS_AV1NV)
 $encoder = if ($useGpu) { $encMap[$Codec].gpu } else { $encMap[$Codec].cpu }
+if ($Codec -eq 'av1' -and -not $HAS_AV1NV) {
+    Write-Warn2 "AV1 NVENC is not available on this GPU -> falling back to CPU encoding (slow)"
+}
 
 Write-Host "==================================================" -ForegroundColor Magenta
 Write-Host "  Optimize-Media  |  preset: $Preset  |  video: $Codec ($encoder$(if($useGpu){' [GPU]'}))" -ForegroundColor Magenta
@@ -323,6 +336,8 @@ $workerScript = {
     $sizeBefore = $item.File.Length
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $tmp = $null
+    # non-null when a successful result must be saved under a new extension (.mov -> .mp4, .heic/.heif -> .jpg)
+    $targetExt = $null
 
     try {
         Update-Active $item.File.Name
@@ -378,6 +393,32 @@ $workerScript = {
                     if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
                     $tool = 'libwebp-q85'
                 }
+                '\.heic$|\.heif$' {
+                    # Convert HEIC/HEIF photos to JPEG, keeping EXIF metadata
+                    # (date taken, camera, GPS) via -map_metadata.
+                    $tmpOut = "$tmp.conv.jpg"
+                    & $ctx.FFMPEG -y -v error -i $tmp -map_metadata 0 -c:v mjpeg -q:v 2 $tmpOut 2>&1 | Out-Null
+                    if ((Test-Path $tmpOut) -and (Test-MediaValid $tmpOut)) {
+                        Remove-Item -LiteralPath $tmp -Force
+                        Move-Item -LiteralPath $tmpOut -Destination $tmp -Force
+                        $targetExt = '.jpg'
+                        $tool = 'ffmpeg-mjpeg'
+                        # optional extra lossless/lossy pass with the JPEG optimizer
+                        if ($ctx.JPEGTOOL -and $ctx.JPEGKIND -eq 'jpegoptim') {
+                            & $ctx.JPEGTOOL --keep-all --all-progressive $tmp 2>&1 | Out-Null
+                            $tool = 'jpegoptim-lossless+exif'
+                        } elseif ($ctx.JPEGTOOL) {
+                            $tmpQ = "$tmp.q.jpg"
+                            & $ctx.JPEGTOOL -quality $ctx.jpgQ -optimize -progressive -outfile $tmpQ $tmp 2>&1 | Out-Null
+                            if ((Test-Path $tmpQ) -and ((Get-Item $tmpQ).Length -lt (Get-Item $tmp).Length)) {
+                                Move-Item -LiteralPath $tmpQ -Destination $tmp -Force
+                                $tool = "mozjpeg-q$($ctx.jpgQ)"
+                            } else {
+                                Remove-Item -LiteralPath $tmpQ -Force -ErrorAction SilentlyContinue
+                            }
+                        }
+                    }
+                }
                 default {
                     $tmpOut = "$tmp.out$ext"
                     & $ctx.FFMPEG -y -v error -i $tmp $tmpOut 2>&1 | Out-Null
@@ -397,8 +438,11 @@ $workerScript = {
             $origMeta = @{}
             try {
                 $tagsJson = & $ctx.FFPROBE -v error -show_entries format_tags -of json $src 2>&1 | Out-String
-                $tags = ($tagsJson | ConvertFrom-Json).format.tags
-                if ($tags) { $tags.PSObject.Properties | ForEach-Object { $origMeta[$_.Name] = $_.Value } }
+                # regex instead of ConvertFrom-Json: the JSON parser coerces ISO
+                # date strings (creation_time) into DateTime and corrupts them
+                foreach ($m in [regex]::Matches($tagsJson, '"([^"]+)"\s*:\s*"((?:[^"\\]|\\.)*)"')) {
+                    $origMeta[$m.Groups[1].Value] = $m.Groups[2].Value
+                }
             } catch { }
 
             $encArgs = @()
@@ -424,6 +468,8 @@ $workerScript = {
             if ($durBefore -gt 0 -and $durAfter -gt 0 -and [math]::Abs($durAfter - $durBefore) -gt 1.0) {
                 throw "duration mismatch ($durBefore vs $durAfter)"
             }
+            # .mov input is written back as a real .mp4 file on success
+            if ($ext -eq '.mov') { $targetExt = '.mp4' }
         }
 
         $sizeAfter = (Get-Item $tmp).Length
@@ -435,6 +481,15 @@ $workerScript = {
                 path = $src; kind = $item.Kind; before = $sizeBefore; after = $sizeBefore
                 saved_pct = 0; tool = $tool; seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1)
                 status = 'skipped-small-gain'
+            }
+        }
+
+        # final destination path (.mov -> .mp4, .heic/.heif -> .jpg)
+        $finalPath = $src
+        if ($targetExt) {
+            $finalPath = [System.IO.Path]::ChangeExtension($src, $targetExt)
+            if (Test-Path -LiteralPath $finalPath) {
+                throw "cannot rename: destination already exists: $finalPath"
             }
         }
 
@@ -455,20 +510,24 @@ $workerScript = {
             $origItem = Get-Item -LiteralPath $src -Force
             $origTimes = @{ c = $origItem.CreationTime; w = $origItem.LastWriteTime; a = $origItem.LastAccessTime }
         } catch { }
-        Copy-Item -LiteralPath $tmp -Destination $src -Force
-        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+        Copy-Item -LiteralPath $tmp -Destination $finalPath -Force
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
         # restore original timestamps (copy resets Created date otherwise)
         if ($origTimes) {
             try {
-                $newItem = Get-Item -LiteralPath $src -Force
+                $newItem = Get-Item -LiteralPath $finalPath -Force
                 $newItem.CreationTime   = $origTimes.c
                 $newItem.LastWriteTime  = $origTimes.w
                 $newItem.LastAccessTime = $origTimes.a
             } catch { }
         }
+        # remove the original when the extension changed
+        if ($finalPath -ne $src) {
+            Remove-Item -LiteralPath $src -Force
+        }
 
         return [pscustomobject]@{
-            path = $src; kind = $item.Kind; before = $sizeBefore; after = $sizeAfter
+            path = $finalPath; kind = $item.Kind; before = $sizeBefore; after = $sizeAfter
             saved_pct = [math]::Round($savingPct, 1); tool = $tool; seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1)
             status = 'ok'
         }
