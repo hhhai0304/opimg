@@ -34,7 +34,9 @@ param(
     [switch]$Backup,
     [switch]$WhatIf,
     [switch]$Force,
-    [double]$MinSaving = 5,
+    # 0 = accept any real saving; the original is never replaced by an
+    # equal-or-larger file regardless of this value
+    [double]$MinSaving = 0,
 
     [string[]]$Include,
     [string[]]$Exclude,
@@ -493,7 +495,6 @@ $workerScript = {
             $encArgs = @()
             if ($ctx.useGpu) {
                 $encArgs = @('-c:v', $ctx.encoder, '-preset', $ctx.nvPreset, '-cq', $ctx.cq, '-rc', 'constqp')
-                if ($ctx.Codec -eq 'av1') { $encArgs = @('-c:v', $ctx.encoder, '-preset', $ctx.nvPreset, '-cq', $ctx.cq) }
             } else {
                 $encArgs = @('-c:v', $ctx.encoder, '-crf', $ctx.cpuCrf, '-preset', $ctx.cpuPreset)
                 if ($ctx.Codec -eq 'hevc') { $encArgs += @('-tag:v', 'hvc1') }
@@ -530,7 +531,9 @@ $workerScript = {
         $sizeAfter = (Get-Item $tmp).Length
         $savingPct = if ($sizeBefore -gt 0) { (1 - $sizeAfter / $sizeBefore) * 100 } else { 0 }
 
-        if ($savingPct -lt $ctx.MinSaving) {
+        # never replace the original with an equal-or-larger file;
+        # MinSaving is opt-in on top of that
+        if ($sizeAfter -ge $sizeBefore -or $savingPct -lt $ctx.MinSaving) {
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue
             return [pscustomobject]@{
                 path = $src; kind = $item.Kind; before = $sizeBefore; after = $sizeBefore
