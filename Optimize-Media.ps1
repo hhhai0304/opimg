@@ -34,6 +34,8 @@ param(
     [switch]$Backup,
     [switch]$WhatIf,
     [switch]$Force,
+    # process video files only, ignore images
+    [switch]$OnlyVideo,
     # 0 = accept any real saving; the original is never replaced by an
     # equal-or-larger file regardless of this value
     [double]$MinSaving = 0,
@@ -173,7 +175,9 @@ $perfProp = $cfg.PSObject.Properties['performance']
 $perf = @{}
 if ($perfProp) { $perfProp.Value.PSObject.Properties | ForEach-Object { $perf[$_.Name] = $_.Value } }
 $logical = if ($perf.logicalCores) { [int]$perf.logicalCores } else { [int](Get-CimInstance Win32_Processor).NumberOfLogicalProcessors }
-if ($ImageWorkers -le 0) { $ImageWorkers = if ($perf.imageWorkers) { [int]$perf.imageWorkers } else { [math]::Max(2, $logical - 4) } }
+# image tools are single-threaded per file, so default to nearly all logical
+# cores; extra workers also pipeline SMB/network I/O when sources are remote
+if ($ImageWorkers -le 0) { $ImageWorkers = if ($perf.imageWorkers) { [int]$perf.imageWorkers } else { [math]::Max(2, [int][math]::Ceiling($logical * 0.9)) } }
 if ($VideoWorkers -le 0) {
     $VideoWorkers = if ($perf.videoWorkers) { [int]$perf.videoWorkers }
     elseif ($HAS_NVENC) { 2 } else { 2 }
@@ -262,6 +266,7 @@ foreach ($curPath in $pathList) {
         $ext = $f.Extension.ToLower()
         $isMedia = $script:ImageExt -contains $ext -or $script:VideoExt -contains $ext
         if (-not $isMedia) { continue }
+        if ($OnlyVideo -and $script:VideoExt -notcontains $ext) { continue }
         if ($Include -and ($Include | ForEach-Object { $_.ToLower().TrimStart('.') }) -notcontains $ext.TrimStart('.')) { continue }
         if ($Exclude -and ($Exclude | ForEach-Object { $_.ToLower().TrimStart('.') }) -contains $ext.TrimStart('.')) { continue }
         $kind = if ($script:ImageExt -contains $ext) { 'image' } else { 'video' }

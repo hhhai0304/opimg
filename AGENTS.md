@@ -27,6 +27,7 @@ CLI tool to compress images and videos optimally on Windows, with SMB/network pa
 .\Optimize-Media.ps1 <path> -Force            # recompress already-processed files
 .\Optimize-Media.ps1 <path> -Codec h264       # force video codec
 .\Optimize-Media.ps1 <path> -AV1              # shorthand for -Codec av1 (GPU speed needs RTX 40xx)
+.\Optimize-Media.ps1 <path> -OnlyVideo        # ignore image files, process videos only
 ```
 
 Or drag-and-drop a folder onto `Optimize-Media.cmd`.
