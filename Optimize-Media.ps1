@@ -211,6 +211,10 @@ if (-not $Codec) {
         default   { 'hevc' }
     }
 }
+
+# rename converted files (.mov -> .mp4, .heic/.heif -> .jpg)? default: keep original extensions
+$convExtProp = $cfg.PSObject.Properties['convert_extension']
+$ConvertExt = if ($convExtProp) { [bool]$convExtProp.Value } else { $false }
 $encMap = @{
     hevc = @{ gpu = 'hevc_nvenc'; cpu = 'libx265'; tag = 'hvc1' }
     h264 = @{ gpu = 'h264_nvenc'; cpu = 'libx264'; tag = 'avc1' }
@@ -223,9 +227,27 @@ if ($Codec -eq 'av1' -and -not $HAS_AV1NV) {
 }
 
 Write-Host "==================================================" -ForegroundColor Magenta
-Write-Host "  Optimize-Media  |  preset: $Preset  |  video: $Codec ($encoder$(if($useGpu){' [GPU]'}))$(if($OnlyVideo){'  |  VIDEOS ONLY'})" -ForegroundColor Magenta
+Write-Host "  Optimize-Media  |  preset: $Preset  |  video: $Codec ($encoder$(if($useGpu){' [GPU]'}))$(if($OnlyVideo){'  |  VIDEOS ONLY'})$(if($ConvertExt){'  |  RENAME EXT'})" -ForegroundColor Magenta
 Write-Host "  Workers: $ImageWorkers images + $VideoWorkers videos (parallel)" -ForegroundColor Magenta
 Write-Host "==================================================" -ForegroundColor Magenta
+
+# first-run quick guide (shown once, marker lives in logs/)
+$usageMarker = Join-Path $script:LogDir '.usage-shown'
+if (-not (Test-Path $usageMarker)) {
+    Write-Host @"
+  First time here? Quick usage:
+    Optimize-Media.ps1 <folder-or-file>          compress everything inside
+      -Preset fast|balanced|max|archive          quality/speed preset
+      -Codec h264|hevc|av1  or  -AV1             video codec (default H.265)
+      -OnlyVideo                                 skip image files
+      -Backup                                    keep originals in backup\
+      -MinSaving N                               require N% saving (default 0)
+      -WhatIf                                    scan and estimate only
+      -Force                                     re-process already-done files
+    Wrappers: Optimize-Media.cmd (Windows), .sh (Linux/macOS)
+"@ -ForegroundColor DarkGray
+    Set-Content -LiteralPath $usageMarker -Value (Get-Date).ToString('s') -Encoding UTF8
+}
 
 # ============================================================ collect files
 $mediaFiles = @()
@@ -436,29 +458,38 @@ $workerScript = {
                     $tool = 'libwebp-q85'
                 }
                 '\.heic$|\.heif$' {
-                    # Convert HEIC/HEIF photos to JPEG, keeping EXIF metadata
-                    # (date taken, camera, GPS) via -map_metadata.
-                    $tmpOut = "$tmp.conv.jpg"
-                    & $ctx.FFMPEG -y -v error -i $tmp -map_metadata 0 -c:v mjpeg -q:v 2 $tmpOut 2>&1 | Out-Null
-                    if ((Test-Path $tmpOut) -and (Test-MediaValid $tmpOut)) {
-                        Remove-Item -LiteralPath $tmp -Force
-                        Move-Item -LiteralPath $tmpOut -Destination $tmp -Force
-                        $targetExt = '.jpg'
-                        $tool = 'ffmpeg-mjpeg'
-                        # optional extra lossless/lossy pass with the JPEG optimizer
-                        if ($ctx.JPEGTOOL -and $ctx.JPEGKIND -eq 'jpegoptim') {
-                            & $ctx.JPEGTOOL --keep-all --all-progressive $tmp 2>&1 | Out-Null
-                            $tool = 'jpegoptim-lossless+exif'
-                        } elseif ($ctx.JPEGTOOL) {
-                            $tmpQ = "$tmp.q.jpg"
-                            & $ctx.JPEGTOOL -quality $ctx.jpgQ -optimize -progressive -outfile $tmpQ $tmp 2>&1 | Out-Null
-                            if ((Test-Path $tmpQ) -and ((Get-Item $tmpQ).Length -lt (Get-Item $tmp).Length)) {
-                                Move-Item -LiteralPath $tmpQ -Destination $tmp -Force
-                                $tool = "mozjpeg-q$($ctx.jpgQ)"
-                            } else {
-                                Remove-Item -LiteralPath $tmpQ -Force -ErrorAction SilentlyContinue
+                    if ($ctx.ConvertExtension) {
+                        # Convert HEIC/HEIF photos to JPEG, keeping EXIF metadata
+                        # (date taken, camera, GPS) via -map_metadata.
+                        $tmpOut = "$tmp.conv.jpg"
+                        & $ctx.FFMPEG -y -v error -i $tmp -map_metadata 0 -c:v mjpeg -q:v 2 $tmpOut 2>&1 | Out-Null
+                        if ((Test-Path $tmpOut) -and (Test-MediaValid $tmpOut)) {
+                            Remove-Item -LiteralPath $tmp -Force
+                            Move-Item -LiteralPath $tmpOut -Destination $tmp -Force
+                            $targetExt = '.jpg'
+                            $tool = 'ffmpeg-mjpeg'
+                            # optional extra lossless/lossy pass with the JPEG optimizer
+                            if ($ctx.JPEGTOOL -and $ctx.JPEGKIND -eq 'jpegoptim') {
+                                & $ctx.JPEGTOOL --keep-all --all-progressive $tmp 2>&1 | Out-Null
+                                $tool = 'jpegoptim-lossless+exif'
+                            } elseif ($ctx.JPEGTOOL) {
+                                $tmpQ = "$tmp.q.jpg"
+                                & $ctx.JPEGTOOL -quality $ctx.jpgQ -optimize -progressive -outfile $tmpQ $tmp 2>&1 | Out-Null
+                                if ((Test-Path $tmpQ) -and ((Get-Item $tmpQ).Length -lt (Get-Item $tmp).Length)) {
+                                    Move-Item -LiteralPath $tmpQ -Destination $tmp -Force
+                                    $tool = "mozjpeg-q$($ctx.jpgQ)"
+                                } else {
+                                    Remove-Item -LiteralPath $tmpQ -Force -ErrorAction SilentlyContinue
+                                }
                             }
                         }
+                    } else {
+                        # keep the original extension: generic same-format re-encode,
+                        # kept only when smaller (EXIF carried over best-effort)
+                        $tmpOut = "$tmp.out$ext"
+                        & $ctx.FFMPEG -y -v error -i $tmp -map_metadata 0 $tmpOut 2>&1 | Out-Null
+                        if ((Test-Path $tmpOut) -and ((Get-Item $tmpOut).Length -lt (Get-Item $tmp).Length)) { Move-Item $tmpOut $tmp -Force }
+                        $tool = 'ffmpeg'
                     }
                 }
                 default {
@@ -530,7 +561,8 @@ $workerScript = {
                 throw "duration mismatch ($durBefore vs $durAfter)"
             }
             # every video is written back as a real .mp4 container on success
-            if ($ext -notin @('.mp4', '.m4v')) { $targetExt = '.mp4' }
+            # (only when extension conversion is enabled in config)
+            if ($ConvertExt -and $ext -notin @('.mp4', '.m4v')) { $targetExt = '.mp4' }
         }
 
         $sizeAfter = (Get-Item $tmp).Length
@@ -632,6 +664,7 @@ $ctx = @{
     jpgQ = $P.jpgQ; pngQ = $P.pngQ
     Mp4AudioCodecs = $script:Mp4AudioCodecs
     TargetCodecName = $Codec
+    ConvertExtension = [bool]$ConvertExt
 }
 
 # ============================================================ runspace pools

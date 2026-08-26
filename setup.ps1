@@ -66,6 +66,22 @@ Write-Host "==============================================" -ForegroundColor Mag
 Write-Host "  Optimize-Media - Setup" -ForegroundColor Magenta
 Write-Host "==============================================" -ForegroundColor Magenta
 
+# OS detection: Windows PowerShell 5.1 has no $IsWindows variables at all
+$osName = if ($PSVersionTable.PSVersion.Major -ge 6) {
+    if ($IsWindows) { 'windows' } elseif ($IsMacOS) { 'macos' } else { 'linux' }
+} else { 'windows' }
+Write-Host "Detected OS: $osName"
+
+# preserve user preferences across setup re-runs
+$prior = @{}
+if (Test-Path $script:ConfigPath) {
+    try {
+        $old = Get-Content $script:ConfigPath -Raw | ConvertFrom-Json
+        $old.PSObject.Properties | Where-Object { $_.Name -notin @('tools', 'gpu', 'updated', 'performance') } |
+            ForEach-Object { $prior[$_.Name] = $_.Value }
+    } catch { }
+}
+
 foreach ($d in @($script:ToolsDir, $script:TempDir, $script:LogDir)) {
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d | Out-Null }
 }
@@ -75,6 +91,62 @@ if (-not (Test-Path $dlDir)) { New-Item -ItemType Directory -Path $dlDir | Out-N
 
 $tools = @{}   # name -> @{ Path=...; Source='path'|'portable'|'winget'|'missing'; Kind=... }
 
+# On Unix everything comes from the system package manager, so the four
+# Windows download sections below are skipped entirely.
+$usingPkgMgr = ($osName -ne 'windows')
+if ($usingPkgMgr) {
+    Write-Step "1-4/4  Installing tools via system package manager"
+    $pkgs = @(); $pkg = $null
+    if ($osName -eq 'macos') {
+        $pkg = 'brew'; $pkgs = @('ffmpeg', 'oxipng', 'pngquant', 'jpegoptim', 'mozjpeg')
+    } else {
+        foreach ($cand in @('apt-get', 'dnf', 'pacman')) { if (Test-ToolOnPath $cand) { $pkg = $cand; break } }
+        $pkgs = switch ($pkg) {
+            'apt-get' { @('ffmpeg', 'oxipng', 'pngquant', 'jpegoptim') }
+            'dnf'     { @('ffmpeg', 'oxipng', 'pngquant', 'jpegoptim') }
+            'pacman'  { @('ffmpeg', 'oxipng', 'pngquant', 'jpegoptim') }
+            default   { @() }
+        }
+    }
+    if (-not $pkg -or $pkgs.Count -eq 0) {
+        Write-Fail "No supported package manager found (brew/apt-get/dnf/pacman)."
+        Write-Fail "Install manually: ffmpeg ffprobe oxipng pngquant jpegoptim, then re-run setup.ps1"
+    } else {
+        $sudo = @()
+        if ($osName -ne 'macos' -and [int](& id -u) -ne 0 -and (Test-ToolOnPath 'sudo')) { $sudo = @('sudo') }
+        Write-Host "    Installing $($pkgs -join ', ') via $pkg..."
+        try {
+            switch ($pkg) {
+                'brew'    { & brew install @pkgs 2>&1 | Out-Null }
+                'apt-get' { & @($sudo + $pkg + 'update') 2>&1 | Out-Null; & @($sudo + $pkg + 'install' + '-y' + $pkgs) 2>&1 | Out-Null }
+                'dnf'     { & @($sudo + $pkg + 'install' + '-y' + $pkgs) 2>&1 | Out-Null }
+                'pacman'  { & @($sudo + $pkg + '-S' + '--needed' + '--noconfirm' + $pkgs) 2>&1 | Out-Null }
+            }
+        } catch {
+            Write-Fail "Package installation issue: $($_.Exception.Message)"
+        }
+        # resolve installed binaries (cjpeg/mozjpeg preferred, jpegoptim fallback)
+        $cj = Test-ToolOnPath 'cjpeg'
+        if ($cj) { $tools['cjpeg'] = @{ Path = $cj; Source = 'pkg' }; Write-Ok "cjpeg: $cj" }
+        $jo = Test-ToolOnPath 'jpegoptim'
+        if ($jo -and -not $tools.ContainsKey('cjpeg')) {
+            $tools['cjpeg'] = @{ Path = $jo; Source = 'pkg'; Kind = 'jpegoptim' }
+            Write-Ok "jpegoptim: $jo"
+        }
+        foreach ($t in @('ffmpeg', 'ffprobe', 'oxipng', 'pngquant')) {
+            $hit = Test-ToolOnPath $t
+            if ($hit) {
+                $tools[$t] = @{ Path = $hit; Source = 'pkg' }
+                Write-Ok "${t}: $hit"
+            } else {
+                $tools[$t] = @{ Path = $null; Source = 'missing' }
+                Write-Fail "$t not found after install"
+            }
+        }
+    }
+}
+
+if (-not $usingPkgMgr) {
 # ============================================================ 1. ffmpeg + ffprobe
 Write-Step "1/4  ffmpeg + ffprobe"
 $ff = Test-ToolOnPath 'ffmpeg'
@@ -219,21 +291,41 @@ if ($pq -and -not $Force) {
         }
     }
 }
+} # end Windows download sections
 
 # ============================================================ GPU check
 Write-Step "Checking NVIDIA GPU (NVENC)"
 $hasNvenc = $false
 $gpuName  = '(no NVIDIA GPU)'
 try {
-    $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1
-    if ($gpu -and $tools['ffmpeg'].Path) {
-        $gpuName = $gpu.Name
+    switch ($osName) {
+        'windows' {
+            $gpu = Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1
+            if ($gpu) { $gpuName = [string]$gpu.Name }
+        }
+        'linux' {
+            $smi = & nvidia-smi --query-gpu=name --format=csv,noheader 2>$null | Select-Object -First 1
+            if ($smi) { $gpuName = [string]$smi }
+            else {
+                $pci = & lspci 2>$null | Where-Object { $_ -match 'NVIDIA' } | Select-Object -First 1
+                if ($pci) { $gpuName = (($pci -split ':', 2)[-1] -split '\(')[0].Trim() }
+            }
+        }
+        'macos' {
+            # no NVIDIA drivers on modern macOS; report chipset for context
+            $sp = (system_profiler SPDisplaysDataType 2>$null | Out-String)
+            if ($sp -match 'Chipset Model:\s*(.+)') { $gpuName = $Matches[1].Trim() }
+        }
+    }
+    # the ffmpeg probe is the real test and works identically on every OS
+    if ($tools['ffmpeg'].Path) {
         if ((Test-NvencEncoder $tools['ffmpeg'].Path 'hevc_nvenc') -or (Test-NvencEncoder $tools['ffmpeg'].Path 'h264_nvenc')) {
             $hasNvenc = $true
         }
     }
 } catch { }
 if ($hasNvenc)  { Write-Ok "NVENC ready on: $gpuName -> GPU video encoding, very fast" }
+elseif ($osName -eq 'macos') { Write-Warn2 "$($gpuName): no NVENC on macOS -> video will use CPU (x265/SVT-AV1)" }
 elseif ($gpuName -ne '(no NVIDIA GPU)') { Write-Warn2 "Found $gpuName but NVENC is not usable -> will use CPU" }
 else { Write-Warn2 "No NVIDIA GPU -> video will use CPU (x265), slower but still good" }
 
@@ -247,6 +339,43 @@ if ($hasNvenc -and $tools['ffmpeg'].Path) {
     } catch { }
 }
 
+# ============================================================ user preferences
+# First setup asks; later runs reuse the stored answers unless -Force.
+# Everything is written explicitly into config.json so the choice is visible.
+Write-Step "Preferences"
+$priorCodec = if ($prior.ContainsKey('codec')) { [string]$prior['codec'] } else { $null }
+$priorConvExt = if ($prior.ContainsKey('convert_extension')) { [bool]$prior['convert_extension'] } else { $null }
+$interactive = ($Host.Name -eq 'ConsoleHost')
+
+# video codec preference (default H.265/HEVC)
+$preferAv1 = ($priorCodec -eq 'av1')
+if ($priorCodec -and -not $Force) {
+    Write-Ok "Video codec preference kept from earlier setup: $(if ($preferAv1) { 'AV1' } else { 'H.265/HEVC' })"
+} elseif (-not $interactive) {
+    Write-Info "Non-interactive session -> codec defaults to H.265/HEVC"
+    $preferAv1 = $false
+} elseif ($hasAv1Nvenc) {
+    $ans = Read-Host "Prefer AV1 over H.265? ~15-25% smaller files, playback needs newer devices [y/N]"
+    $preferAv1 = ($ans -match '^(y|yes)$')
+    Write-Host "  -> codec preference: $(if ($preferAv1) { 'AV1' } else { 'H.265/HEVC' })"
+} else {
+    Write-Warn2 "AV1 hardware encoding not available on this GPU -> keeping H.265/HEVC default"
+    $preferAv1 = $false
+}
+
+# extension conversion preference (default: keep the original extension)
+$convertExt = [bool]$priorConvExt
+if ($null -ne $priorConvExt -and -not $Force) {
+    Write-Ok "File name preference kept from earlier setup: $(if ($convertExt) { 'auto-rename (.mov->.mp4, .heic->.jpg)' } else { 'keep original extensions' })"
+} elseif (-not $interactive) {
+    Write-Info "Non-interactive session -> original file extensions are kept"
+    $convertExt = $false
+} else {
+    $ans2 = Read-Host "Auto-rename converted files (.mov->.mp4, .heic->.jpg)? N keeps original names [y/N]"
+    $convertExt = ($ans2 -match '^(y|yes)$')
+    Write-Host "  -> file names: $(if ($convertExt) { 'auto-rename on success' } else { 'keep original extensions' })"
+}
+
 # ============================================================ save config
 $config = @{
     tools = @{}
@@ -255,6 +384,9 @@ $config = @{
         av1_nvenc = $hasAv1Nvenc
         name      = $gpuName
     }
+    # explicit preferences so the choice is visible in the file
+    codec              = $(if ($preferAv1) { 'av1' } else { 'hevc' })
+    convert_extension  = $convertExt
     updated = (Get-Date).ToString('s')
 }
 foreach ($k in $tools.Keys) {
@@ -296,7 +428,8 @@ if ($tools['ffmpeg'].Path -and $tools['ffprobe'].Path) {
     }
     Write-Host "`nQuick start:" -ForegroundColor Cyan
     Write-Host "   .\Optimize-Media.ps1 `"\\NAS\share\path\to\media`""
-    Write-Host "   (or drag-and-drop a folder onto Optimize-Media.cmd)"
+    $wrapHint = if ($osName -eq 'windows') { "   (or drag-and-drop a folder onto Optimize-Media.cmd)" } else { "   (or run: ./Optimize-Media.sh <path>)" }
+    Write-Host $wrapHint
 } else {
     Write-Host "`nSetup FAILED: ffmpeg/ffprobe are required. Check your network and re-run setup.ps1" -ForegroundColor Red
     exit 1

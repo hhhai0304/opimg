@@ -1,0 +1,2 @@
+# keep shell wrappers executable and LF-only on every platform
+*.sh text eol=lf
