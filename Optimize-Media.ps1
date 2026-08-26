@@ -583,25 +583,17 @@ try {
     Queue-Work $imgQueue $ImageWorkers 'image'
 
     # ============================================================ progress UI
-    # A single-line live progress bar (OVERWRITTEN in place when the console
-    # supports it, otherwise a throttled short line). No more multi-line spam.
+    # A single-line live progress bar, OVERWRITTEN in place with \r. State
+    # variables live in $script: scope so they persist across calls (plain
+    # assignments inside a function would create throwaway locals).
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $totalWork = $pending.Count
     $totalWorkBytes = (($vidQueue + $imgQueue) | ForEach-Object { $_.File.Length } | Measure-Object -Sum).Sum
     $results = New-Object System.Collections.Generic.List[object]
     $doneCount = 0; $doneBytes = 0; $savedBytes = 0; $failCount = 0
-    $recent = New-Object 'System.Collections.Generic.Queue[string]'
 
-    # Cursor UI is used only when we can actually repaint in place.
-    $useCursorUI = $false
-    if (-not [Console]::IsOutputRedirected) {
-        try { [void][Console]::CursorLeft; $useCursorUI = $true } catch { $useCursorUI = $false }
-    }
-    $statusTop = -1
-    $statusLines = 1
-    $lastBlob = ''
-    $lastTick = 0
-    $script:fallbackMode = $false
+    $script:lastLine = ''
+    $script:lastTick = -1
 
     function Clip-Text([string]$s) {
         if ($null -eq $s) { return '' }
@@ -622,49 +614,35 @@ try {
         [System.Threading.Monitor]::Enter($state.SyncRoot)
         try { $active = @($state.Active.Values) } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
         $working = if ($active.Count) { ($active -join ', ') } else { 'idle' }
-        if ($working.Length -gt 90) { $working = $working.Substring(0, 87) + '...' }
+        if ($working.Length -gt 60) { $working = $working.Substring(0, 57) + '...' }
 
-        $line1 = ("[{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4} ({5:N0}%)  |  ETA {6}" -f
-            $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), $savedP, (Format-Duration $eta))
+        $line = Clip-Text ("  [{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4} ({5:N0}%)  |  ETA {6}  |  now: {7}" -f
+            $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), $savedP, (Format-Duration $eta), $working)
 
-        if ($useCursorUI) {
-            $blob = $line1 + "`n  now: $working"
-            if (-not $force -and $blob -eq $lastBlob) { return }
-            $lastBlob = $blob   # skip repaints when nothing changed
-            try {
-                $w = [Math]::Max(0, [Console]::WindowWidth - 1)
-                if ($statusTop -lt 0) {
-                    [Console]::WriteLine((Clip-Text $line1).PadRight($w))
-                    [Console]::WriteLine((Clip-Text ("  now: $working")).PadRight($w))
-                    $statusTop = [Console]::CursorTop - 2
-                    $statusLines = 2
-                } else {
-                    [Console]::SetCursorPosition(0, $statusTop)
-                    [Console]::WriteLine((Clip-Text $line1).PadRight($w))
-                    [Console]::WriteLine((Clip-Text ("  now: $working")).PadRight($w))
-                }
-                [Console]::Title = ("Optimize-Media {0:N0}% ({1}/{2})" -f $pct, $doneCount, $totalWork)
-                return
-            } catch {
-                $script:useCursorUI = $false
+        # skip redraw when nothing changed (except the forced final render)
+        $changed = $line -ne $script:lastLine
+        if ($changed) { $script:lastLine = $line }
+
+        if ([Console]::IsOutputRedirected) {
+            # cannot overwrite lines when output is redirected: print at most
+            # one line per second, and never repeat an identical line
+            if (-not $changed) { return }
+            $tick = [int]$stopwatch.Elapsed.TotalSeconds
+            if (-not $force) {
+                if ($tick -le $script:lastTick) { return }
+                $script:lastTick = $tick
             }
+            [Console]::Out.WriteLine($line)
+            return
         }
 
-        # Fallback: overwrite the SAME line in place with \r so the terminal
-        # never scrolls with duplicate progress lines (a single moving bar).
-        if (-not $force) {
-            $nowTick = [int]$stopwatch.Elapsed.TotalSeconds
-            if ($nowTick -le $lastTick) { return }
-            $lastTick = $nowTick
-        }
-        $w = try { [Math]::Max(0, [Console]::WindowWidth - 1) } catch { 120 }
-        $padded = (Clip-Text ("  {0}  |  now: {1}" -f $line1, $working)).PadRight($w)
         try {
-            [Console]::Out.Write("`r" + $padded)
+            $w = [Math]::Max(0, [Console]::WindowWidth - 1)
+            [Console]::Out.Write("`r" + $line.PadRight($w))
         } catch {
-            [Console]::Out.Write(("`r" + $padded + "`n"))
+            [Console]::Out.Write("`r" + $line)
         }
-        $script:fallbackMode = $true
+        if ($force) { [Console]::Out.Write("`n") }
     }
 
     while ($pending.Count -gt 0) {
@@ -681,12 +659,8 @@ try {
                         $doneBytes += $r.before
                         if ($r.status -eq 'ok') {
                             $savedBytes += ($r.before - $r.after)
-                            $recent.Enqueue(("{0} -{1:N0}%" -f $r.path.Split('\')[-1], $r.saved_pct))
-                            while ($recent.Count -gt 4) { [void]$recent.Dequeue() }
                         } elseif ($r.status -like 'fail*') {
                             $failCount++
-                            $recent.Enqueue(("FAILED: {0}" -f $r.path.Split('\')[-1]))
-                            while ($recent.Count -gt 4) { [void]$recent.Dequeue() }
                         }
                     }
                 } catch {
@@ -708,14 +682,6 @@ try {
     $stopwatch.Stop()
 } finally {
     foreach ($p in $pools) { $p.Close(); $p.Dispose() }
-    if ($useCursorUI -and $statusTop -ge 0) {
-        try {
-            $w = [math]::Max(0, [Console]::WindowWidth - 1)
-            [Console]::SetCursorPosition(0, $statusTop)
-            foreach ($i in 1..$statusLines) { [Console]::WriteLine(''.PadRight($w)) }
-            [Console]::SetCursorPosition(0, $statusTop)
-        } catch { }
-    }
     [Console]::Title = "Optimize-Media - done"
 }
 
