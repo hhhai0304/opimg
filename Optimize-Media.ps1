@@ -504,10 +504,17 @@ $workerScript = {
             $metaArgs = @()
             foreach ($k in $origMeta.Keys) { $metaArgs += @('-metadata', "$k=$($origMeta[$k])") }
 
+            # live per-file progress: ffmpeg writes key=value stats to this file
+            # and the main thread reads it while the encode runs
+            $progFile = Join-Path $ctx.TempDir ("prog_" + [guid]::NewGuid().ToString('N') + '.txt')
+            [System.Threading.Monitor]::Enter($state.SyncRoot)
+            try { $state.Prog[$src] = @{ File = $progFile; Dur = [double]$durBefore } } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+
             # explicit stream maps so nothing depends on ffmpeg defaults:
             # first video stream + ALL audio tracks, audio bit-exact
             $argsList = @('-y', '-v', 'error', '-i', $src, '-map', '0:v:0', '-map', '0:a?') +
-                $encArgs + @('-c:a', 'copy', '-movflags', '+faststart') + $metaArgs + @($tmp)
+                $encArgs + @('-c:a', 'copy', '-movflags', '+faststart', '-progress', $progFile, '-nostats') +
+                $metaArgs + @($tmp)
             & $ctx.FFMPEG @argsList 2>&1 | Out-Null
 
             if (-not (Test-Path $tmp)) { throw 'ffmpeg did not produce an output' }
@@ -589,6 +596,13 @@ $workerScript = {
         }
     } finally {
         Update-Active $null
+        try {
+            if ($state.Prog.ContainsKey($src)) {
+                $pf = $state.Prog[$src]
+                $state.Prog.Remove($src)
+                Remove-Item -LiteralPath $pf.File -Force -ErrorAction SilentlyContinue
+            }
+        } catch { }
         $watch.Stop()
     }
 }
@@ -596,6 +610,7 @@ $workerScript = {
 # shared state (thread-safe)
 $state = [hashtable]::Synchronized(@{
     Active = [hashtable]::Synchronized(@{})
+    Prog = [hashtable]::Synchronized(@{})
 })
 
 $ctx = @{
@@ -652,6 +667,23 @@ try {
         return $s
     }
 
+    # Read ffmpeg's live -progress output and return the encode percentage,
+    # or -1 when nothing usable has been written yet.
+    function Get-ProgPercent([hashtable]$entry) {
+        try {
+            if (-not (Test-Path -LiteralPath $entry.File)) { return -1 }
+            $lines = @(Get-Content -LiteralPath $entry.File -Tail 40 -ErrorAction Stop)
+            $micro = $null
+            for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+                if ($lines[$i] -match '^out_time_us=(\d+)') { $micro = [double]$Matches[1]; break }
+                if ($lines[$i] -match '^out_time_ms=(\d+)') { $micro = [double]$Matches[1]; break }
+            }
+            if ($null -eq $micro -or $entry.Dur -le 0) { return -1 }
+            $pct = [int][math]::Floor(($micro / 1000000.0) / $entry.Dur * 100)
+            return [math]::Max(0, [math]::Min(100, $pct))
+        } catch { return -1 }
+    }
+
     function Render-Status([bool]$force = $false) {
         $pct    = if ($totalWork -gt 0) { ($doneCount / $totalWork) * 100 } else { 100 }
         $barLen = 24
@@ -660,11 +692,21 @@ try {
         $eta    = if ($doneBytes -gt 0) { ($stopwatch.Elapsed.TotalSeconds / $doneBytes) * ($totalWorkBytes - $doneBytes) } else { 0 }
         $savedP = if ($totalBytesBefore -gt 0) { ($savedBytes / $totalBytesBefore) * 100 } else { 0 }
 
-        $active = @()
+        $activeKeys = @()
         [System.Threading.Monitor]::Enter($state.SyncRoot)
-        try { $active = @($state.Active.Values) } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
-        $working = if ($active.Count) { ($active -join ', ') } else { 'idle' }
-        if ($working.Length -gt 60) { $working = $working.Substring(0, 57) + '...' }
+        try { $activeKeys = @($state.Active.Keys) } finally { [System.Threading.Monitor]::Exit($state.SyncRoot) }
+        $labels = @()
+        foreach ($k in $activeKeys) {
+            $lbl = [string]$state.Active[$k]
+            if ($state.Prog.ContainsKey($k)) {
+                $pp = Get-ProgPercent $state.Prog[$k]
+                if ($pp -ge 0) { $lbl = "{0} {1}%" -f $lbl, $pp }
+            }
+            $labels += $lbl
+        }
+        $labels = @($labels | Sort-Object)
+        $working = if ($labels.Count) { ($labels -join ', ') } else { 'idle' }
+        if ($working.Length -gt 70) { $working = $working.Substring(0, 67) + '...' }
 
         $line = Clip-Text ("  [{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4} ({5:N0}%)  |  ETA {6}  |  now: {7}" -f
             $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), $savedP, (Format-Duration $eta), $working)
