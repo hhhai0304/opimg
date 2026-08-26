@@ -53,6 +53,9 @@ $script:LogDir    = Join-Path $script:RootDir 'logs'
 $script:BackupDir = Join-Path $script:RootDir 'backup'
 $script:ConfigPath = Join-Path $script:RootDir 'config.json'
 
+# Audio codecs ffmpeg can mux into MP4 without re-encoding. Opus/Vorbis are
+# deliberately absent (WebM audio) so those files are skipped safely.
+$script:Mp4AudioCodecs = @('aac', 'mp3', 'mp2', 'ac3', 'eac3', 'alac', 'flac')
 $script:ImageExt = @('.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic', '.heif')
 $script:VideoExt = @('.mp4', '.mov', '.mkv', '.avi', '.m4v', '.wmv', '.flv', '.webm', '.ts', '.mts', '.m2ts', '.mpg', '.mpeg', '.3gp')
 
@@ -323,6 +326,33 @@ $workerScript = {
         & $ctx.FFMPEG -v error -i $file -f null - 2>&1 | Out-Null
         return ($LASTEXITCODE -eq 0)
     }
+    # Probe the stream layout; returns an error string when converting would
+    # lose data (extra tracks, subtitles, attachments, non-MP4 audio...),
+    # or $null when safe to proceed.
+    function Get-SkipReason([string]$file) {
+        try {
+            $videoStreams = @(& $ctx.FFPROBE -v error -select_streams V -show_entries stream=index -of csv=p=0 $file 2>$null | Where-Object { $_ -ne '' })
+            if ($videoStreams.Count -eq 0) { return 'no video stream' }
+            if ($videoStreams.Count -gt 1) { return ('multiple video streams ({0})' -f $videoStreams.Count) }
+
+            $firstCodec = (& $ctx.FFPROBE -v error -select_streams V:0 -show_entries stream=codec_name -of csv=p=0 $file 2>$null | Select-Object -First 1)
+            if ($firstCodec -eq $ctx.TargetCodecName) { return "already $($ctx.Codec)" }
+
+            $subs = @(& $ctx.FFPROBE -v error -select_streams s -show_entries stream=index -of csv=p=0 $file 2>$null | Where-Object { $_ -ne '' })
+            if ($subs.Count -gt 0) { return 'subtitle streams would not survive the container change' }
+
+            $attach = @(& $ctx.FFPROBE -v error -select_streams t -show_entries stream=index -of csv=p=0 $file 2>$null | Where-Object { $_ -ne '' })
+            if ($attach.Count -gt 0) { return 'embedded attachments would be lost' }
+
+            $audioCodecs = @(& $ctx.FFPROBE -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 $file 2>$null | Where-Object { $_ })
+            foreach ($c in $audioCodecs) {
+                if ($ctx.Mp4AudioCodecs -notcontains $c) { return "audio '$c' cannot be copied into MP4" }
+            }
+            return $null
+        } catch {
+            return "probe failed: $($_.Exception.Message)"
+        }
+    }
     function Update-Active([string]$label) {
         [System.Threading.Monitor]::Enter($state.SyncRoot)
         try {
@@ -340,7 +370,12 @@ $workerScript = {
     $targetExt = $null
 
     try {
-        Update-Active $item.File.Name
+        # videos show whether they run on the GPU (NVENC) or CPU encoder
+        $activeLabel = $item.File.Name
+        if ($item.Kind -eq 'video') {
+            $activeLabel += $(if ($ctx.useGpu) { ' [GPU]' } else { ' [CPU]' })
+        }
+        Update-Active $activeLabel
 
         if ($item.Kind -eq 'image') {
             $tmp = Join-Path $ctx.TempDir ("img_" + [guid]::NewGuid().ToString('N') + $ext)
@@ -434,6 +469,16 @@ $workerScript = {
             $tmp = Join-Path $ctx.TempDir ("vid_" + [guid]::NewGuid().ToString('N') + '.mp4')
             $durBefore = Get-VideoDuration $src
 
+            # never convert when the container change could lose data
+            $skipReason = Get-SkipReason $src
+            if ($skipReason) {
+                return [pscustomobject]@{
+                    path = $src; kind = $item.Kind; before = $sizeBefore; after = $sizeBefore
+                    saved_pct = 0; tool = ''; seconds = [math]::Round($watch.Elapsed.TotalSeconds, 1)
+                    status = "skip: $skipReason"
+                }
+            }
+
             # capture container metadata from the ORIGINAL (NVENC does not carry creation_time over)
             $origMeta = @{}
             try {
@@ -459,7 +504,10 @@ $workerScript = {
             $metaArgs = @()
             foreach ($k in $origMeta.Keys) { $metaArgs += @('-metadata', "$k=$($origMeta[$k])") }
 
-            $argsList = @('-y', '-v', 'error', '-i', $src) + $encArgs + @('-c:a', 'copy', '-c:s', 'copy', '-movflags', '+faststart') + $metaArgs + @($tmp)
+            # explicit stream maps so nothing depends on ffmpeg defaults:
+            # first video stream + ALL audio tracks, audio bit-exact
+            $argsList = @('-y', '-v', 'error', '-i', $src, '-map', '0:v:0', '-map', '0:a?') +
+                $encArgs + @('-c:a', 'copy', '-movflags', '+faststart') + $metaArgs + @($tmp)
             & $ctx.FFMPEG @argsList 2>&1 | Out-Null
 
             if (-not (Test-Path $tmp)) { throw 'ffmpeg did not produce an output' }
@@ -468,8 +516,8 @@ $workerScript = {
             if ($durBefore -gt 0 -and $durAfter -gt 0 -and [math]::Abs($durAfter - $durBefore) -gt 1.0) {
                 throw "duration mismatch ($durBefore vs $durAfter)"
             }
-            # .mov input is written back as a real .mp4 file on success
-            if ($ext -eq '.mov') { $targetExt = '.mp4' }
+            # every video is written back as a real .mp4 container on success
+            if ($ext -notin @('.mp4', '.m4v')) { $targetExt = '.mp4' }
         }
 
         $sizeAfter = (Get-Item $tmp).Length
@@ -559,6 +607,8 @@ $ctx = @{
     useGpu = $useGpu; encoder = $encoder; Codec = $Codec
     cq = $P.cq; nvPreset = $P.nvPreset; cpuCrf = $P.cpuCrf; cpuPreset = $P.cpuPreset
     jpgQ = $P.jpgQ; pngQ = $P.pngQ
+    Mp4AudioCodecs = $script:Mp4AudioCodecs
+    TargetCodecName = $Codec
 }
 
 # ============================================================ runspace pools
@@ -701,10 +751,18 @@ Write-Host "==================================================" -ForegroundColor
 
 $okRes   = @($results | Where-Object { $_.status -eq 'ok' })
 $skipRes = @($results | Where-Object { $_.status -eq 'skipped-small-gain' })
+$unsafeRes = @($results | Where-Object { $_.status -like 'skip:*' })
 $failRes = @($results | Where-Object { $_.status -like 'fail*' })
 
 Write-Host ("  Compressed : {0} files" -f $okRes.Count)
 Write-Host ("  Skipped    : {0} files ({1} small-gain, {2} already done earlier)" -f ($skipRes.Count + $preSkipped), $skipRes.Count, $preSkipped)
+if ($unsafeRes.Count -gt 0) {
+    Write-Host ("  Left as-is : {0} files (conversion would lose streams)" -f $unsafeRes.Count) -ForegroundColor Yellow
+    $unsafeRes | Select-Object -First 8 | ForEach-Object {
+        Write-Host ("    - {0}: {1}" -f $_.path.Split('\')[-1], ($_.status -replace '^skip: ', '')) -ForegroundColor Yellow
+    }
+    if ($unsafeRes.Count -gt 8) { Write-Info ("    ... and {0} more" -f ($unsafeRes.Count - 8)) }
+}
 if ($failRes.Count -gt 0) {
     Write-Host ("  Failed     : {0} files" -f $failRes.Count) -ForegroundColor Red
     $failRes | Select-Object -First 5 | ForEach-Object { Write-Host ("    - {0}: {1}" -f $_.path.Split('\')[-1], $_.status) -ForegroundColor Red }

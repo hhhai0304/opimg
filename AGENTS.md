@@ -63,7 +63,8 @@ exactly the UX this script avoids.
 ## Architecture notes
 
 - Parallelism: two runspace pools (image workers / video workers), counts from `config.json > performance`, overridable per-run via `-ImageWorkers` / `-VideoWorkers`
-- Extension conversion on success (original file is deleted after the new file passes validation): `.mov -> .mp4`, `.heic/.heif -> .jpg`. Container/EXIF metadata is preserved; if the destination name already exists, the file is left untouched
+- Extension conversion on success (original file is deleted after the new file passes validation): every video becomes a real `.mp4` container, `.heic/.heif -> .jpg`. Container/EXIF metadata is preserved; if the destination name already exists, the file is left untouched
+- Stream preservation: videos are probed before encoding and left as-is when conversion would lose data — subtitle streams, embedded attachments, multiple video streams, or audio codecs that cannot be copied into MP4 (DTS/PCM/Vorbis...). Explicit `-map 0:v:0 -map 0:a?` keeps ALL audio tracks bit-exact
 - Workers return result objects; the main thread harvests completed runspaces every 250 ms and renders a fixed status block via `[Console]::SetCursorPosition` (falls back to periodic lines when output is redirected)
 - All console output, comments, and docs must stay in English (see Language rule)
 - StrictMode is on: wrap pipeline results that may be a single object in `@()` before using `.Count`
