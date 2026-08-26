@@ -223,7 +223,7 @@ if ($Codec -eq 'av1' -and -not $HAS_AV1NV) {
 }
 
 Write-Host "==================================================" -ForegroundColor Magenta
-Write-Host "  Optimize-Media  |  preset: $Preset  |  video: $Codec ($encoder$(if($useGpu){' [GPU]'}))" -ForegroundColor Magenta
+Write-Host "  Optimize-Media  |  preset: $Preset  |  video: $Codec ($encoder$(if($useGpu){' [GPU]'}))$(if($OnlyVideo){'  |  VIDEOS ONLY'})" -ForegroundColor Magenta
 Write-Host "  Workers: $ImageWorkers images + $VideoWorkers videos (parallel)" -ForegroundColor Magenta
 Write-Host "==================================================" -ForegroundColor Magenta
 
