@@ -692,8 +692,12 @@ try {
     # Two-line live status, OVERWRITTEN in place (line 1: progress bar,
     # line 2: files being processed). State variables live in $script:
     # scope so they persist across calls - plain assignments inside a
-    # function would create throwaway locals. When the console cannot
-    # repaint in place it degrades to a single-line \r overwrite.
+    # function would create throwaway locals. Every repaint re-validates
+    # the anchor (cursor position + window width): long runs are prone to
+    # window resizes, reflows and scrolls that silently move the rows, and
+    # a stale anchor makes the two lines drift and interleave. When the
+    # console cannot repaint in place it degrades to a single-line \r
+    # overwrite.
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $totalWork = $pending.Count
     $totalWorkBytes = (($vidQueue + $imgQueue) | ForEach-Object { $_.File.Length } | Measure-Object -Sum).Sum
@@ -705,11 +709,15 @@ try {
     $script:lastTick = -1
     $script:useTwoLine = $true
     $script:statusTop = -1
+    $script:lastW = -1
 
     function Clip-Text([string]$s) {
         if ($null -eq $s) { return '' }
-        $w = try { [Math]::Max(30, [Console]::WindowWidth - 1) } catch { 120 }
-        if ($s.Length -gt $w) { $s = $s.Substring(0, $w - 1) + '~' }
+        # clip to what the console can hold on one line: a longer string would
+        # wrap and corrupt the in-place row bookkeeping
+        $w = try { [Console]::WindowWidth } catch { -1 }
+        if ($w -lt 2) { return $s }
+        if ($s.Length -gt $w - 2) { $s = $s.Substring(0, $w - 3) + '~' }
         return $s
     }
 
@@ -778,22 +786,70 @@ try {
         }
 
         if ($script:useTwoLine) {
-            try {
-                $w = [Math]::Max(0, [Console]::WindowWidth - 1)
-                if ($script:statusTop -lt 0) {
-                    [Console]::Out.WriteLine($barLine.PadRight($w))
-                    [Console]::Out.WriteLine($nowLine.PadRight($w))
-                    try { $script:statusTop = [Console]::CursorTop - 2 } catch { $script:statusTop = -1; $script:useTwoLine = $false }
-                } else {
-                    [Console]::SetCursorPosition(0, $script:statusTop)
-                    [Console]::Out.WriteLine($barLine.PadRight($w))
-                    [Console]::Out.WriteLine($nowLine.PadRight($w))
-                }
-                return
-            } catch {
-                # console scrolled or resized out from under us -> single-line mode
+            # ----- two-line in-place mode -----
+            # Never trust the saved anchor blindly: a window resize reflows and
+            # wraps existing rows (all saved coordinates go stale) and foreign
+            # output shifts the cursor. Validate before every paint; when the
+            # anchor is gone, wipe the stale rows and append a fresh block.
+            $winW = try { [Console]::WindowWidth } catch { -1 }
+            if ($winW -lt 2) {
+                # cannot read console geometry: degrade permanently
                 $script:useTwoLine = $false
                 $script:statusTop = -1
+                $script:lastW = -1
+            } else {
+                $maxLen = $winW - 1
+                $anchorOk = $false
+                # only trust the anchor when the width is unchanged since the
+                # last paint AND the cursor still sits exactly below our block
+                if ($script:statusTop -ge 0 -and $script:lastW -eq $winW) {
+                    try {
+                        $anchorOk = ([Console]::CursorTop -eq $script:statusTop + 2) -and
+                                    ($script:statusTop + 2 -le [Console]::BufferHeight - 1)
+                    } catch { $anchorOk = $false }
+                }
+
+                if (-not $anchorOk) {
+                    # stale block: blank every row from the old anchor down to
+                    # the cursor (clears wrap residue too), then append fresh
+                    try {
+                        if ($script:statusTop -ge 0) {
+                            $bufH = [Console]::BufferHeight
+                            $start = $script:statusTop
+                            $end = [math]::Min([Console]::CursorTop, $bufH - 1)
+                            if ($end -lt $start) { $end = $start }
+                            $padLen = [math]::Max(1, $maxLen - 1)
+                            $passes = [math]::Ceiling(($script:lastW + 1) / $padLen)
+                            for ($r = $start; $r -le $end; $r++) {
+                                [Console]::SetCursorPosition(0, $r)
+                                for ($p = 0; $p -lt $passes; $p++) {
+                                    [Console]::Out.Write(''.PadRight($padLen) + "`r")
+                                }
+                            }
+                        }
+                        [Console]::Out.WriteLine()
+                    } catch { }
+                    $script:statusTop = -1
+                }
+
+                try {
+                    if ($script:statusTop -lt 0) {
+                        [Console]::Out.WriteLine($barLine.PadRight($maxLen))
+                        [Console]::Out.WriteLine($nowLine.PadRight($maxLen))
+                        $script:statusTop = [Console]::CursorTop - 2
+                    } else {
+                        [Console]::SetCursorPosition(0, $script:statusTop)
+                        [Console]::Out.Write($barLine.PadRight($maxLen))
+                        [Console]::Out.Write($nowLine.PadRight($maxLen))
+                    }
+                    $script:lastW = $winW
+                    return
+                } catch {
+                    # console scrolled or resized out from under us -> single-line mode
+                    $script:useTwoLine = $false
+                    $script:statusTop = -1
+                    $script:lastW = -1
+                }
             }
         }
 
