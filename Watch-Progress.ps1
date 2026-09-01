@@ -43,12 +43,15 @@ function Format-Duration([double]$sec) {
     return $t.ToString('m\m\ ss\s')
 }
 
-# the live Optimize-Media process, if any (read-only query)
-$runProcs = @()
-try {
-    $runProcs = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" |
-        Where-Object { $_.CommandLine -and $_.CommandLine -match 'Optimize-Media\.ps1' })
-} catch { }
+# the live Optimize-Media run, if any: the run's console is a shell wrapper
+# whose command line does not reveal the script, so detect activity by its
+# ffmpeg children and the temp/ folder it fills while encoding
+function Get-RunActive {
+    if (@(Get-Process -Name ffmpeg -ErrorAction SilentlyContinue).Count -gt 0) { return $true }
+    return (@(Get-ChildItem -LiteralPath $tempDir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^(vid_|img_)' }).Count -gt 0)
+}
+$wasActive = Get-RunActive
 
 # temp files already present at start are in-flight, NOT counted as done
 $seen = @{}
@@ -63,11 +66,10 @@ $nvidia = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $logical = try { [int](Get-CimInstance Win32_Processor).NumberOfLogicalProcessors } catch { 1 }
 $lastFfCpu = $null
 $lastFfWall = -1.0
-$wasAlive = ($runProcs.Count -gt 0)
 
 Write-Host "Watching $tempDir (read-only - temp files are never touched). Ctrl+C to stop." -ForegroundColor Cyan
-if ($runProcs.Count -eq 0) {
-    Write-Host "No running Optimize-Media process found - the job may have just finished." -ForegroundColor Yellow
+if (-not $wasActive) {
+    Write-Host "No active Optimize-Media run detected (no ffmpeg, temp empty) - the job may have just finished." -ForegroundColor Yellow
 }
 
 while ($true) {
@@ -103,16 +105,13 @@ while ($true) {
         } catch { }
     }
 
-    $runAlive = $false
-    foreach ($p in $runProcs) {
-        if (Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue) { $runAlive = $true; break }
-    }
+    $runAlive = Get-RunActive
 
-    if ($wasAlive -and -not $runAlive) {
+    if ($wasActive -and -not $runAlive) {
         Write-Host "`nOptimize-Media run has finished." -ForegroundColor Green
         exit 0
     }
-    $wasAlive = $runAlive
+    $wasActive = $runAlive
 
     $parts = @()
     if ($Total -gt 0) {

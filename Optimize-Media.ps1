@@ -721,6 +721,34 @@ try {
         return $s
     }
 
+    function Trunc-Display([string]$s, [int]$maxCells) {
+        if ($null -eq $s -or $maxCells -le 0) { return '' }
+        $cells = 0
+        $sb = [System.Text.StringBuilder]::new($s.Length)
+        foreach ($ch in $s.GetEnumerator()) {
+            $w = if ([int]$ch -ge 0x1100 -and (
+                [int]$ch -le 0x115F -or
+                ([int]$ch -ge 0x2E80 -and [int]$ch -le 0x303E) -or
+                ([int]$ch -ge 0x3041 -and [int]$ch -le 0x33FF) -or
+                ([int]$ch -ge 0x3400 -and [int]$ch -le 0x4DBF) -or
+                ([int]$ch -ge 0x4E00 -and [int]$ch -le 0x9FFF) -or
+                ([int]$ch -ge 0xA000 -and [int]$ch -le 0xA4CF) -or
+                ([int]$ch -ge 0xAC00 -and [int]$ch -le 0xD7A3) -or
+                ([int]$ch -ge 0xF900 -and [int]$ch -le 0xFAFF) -or
+                ([int]$ch -ge 0xFE30 -and [int]$ch -le 0xFE4F) -or
+                ([int]$ch -ge 0xFF00 -and [int]$ch -le 0xFF60) -or
+                ([int]$ch -ge 0xFFE0 -and [int]$ch -le 0xFFE6) -or
+                ([int]$ch -ge 0x20000 -and [int]$ch -le 0x2FFFD) -or
+                ([int]$ch -ge 0x30000 -and [int]$ch -le 0x3FFFD)
+            )) { 2 } else { 1 }
+            if ($cells + $w -gt $maxCells) { break }
+            [void]$sb.Append($ch)
+            $cells += $w
+            if ($cells -eq $maxCells) { break }
+        }
+        return $sb.ToString()
+    }
+
     # Read ffmpeg's live -progress output and return the encode percentage,
     # or -1 when nothing usable has been written yet.
     function Get-ProgPercent([hashtable]$entry) {
@@ -766,6 +794,16 @@ try {
         $barLine = Clip-Text ("  [{0}] {1,5:N1}%  |  {2}/{3} files  |  saved {4} ({5:N0}%)  |  ETA {6}" -f
             $bar, $pct, $doneCount, $totalWork, (Format-Size $savedBytes), $savedP, (Format-Duration $eta))
         $nowLine = Clip-Text ("    now: {0}" -f $working)
+
+        # Final display-width clamp. Console auto-wraps any row that exceeds
+        # WindowWidth and pushes the cursor down, which destroys the in-place
+        # repaint anchor. Clip-Text trims by char count only, but wide (CJK)
+        # glyphs render as 2 cells, so cap by display width here.
+        $maxCells = try { [Console]::WindowWidth - 1 } catch { -1 }
+        if ($maxCells -gt 0) {
+            $barLine = Trunc-Display $barLine $maxCells
+            $nowLine = Trunc-Display $nowLine $maxCells
+        }
 
         # skip redraw when nothing changed (except the forced final render)
         $changed = ($barLine -ne $script:lastBar) -or ($nowLine -ne $script:lastNow) -or $force
