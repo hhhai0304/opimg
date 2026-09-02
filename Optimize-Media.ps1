@@ -365,7 +365,12 @@ $workerScript = {
             if ($videoStreams.Count -gt 1) { return ('multiple video streams ({0})' -f $videoStreams.Count) }
 
             $firstCodec = (& $ctx.FFPROBE -v error -select_streams V:0 -show_entries stream=codec_name -of csv=p=0 $file 2>$null | Select-Object -First 1)
-            if ($firstCodec -eq $ctx.TargetCodecName) { return "already $($ctx.Codec)" }
+            if ($firstCodec -eq $ctx.TargetCodecName) {
+                # -Force re-runs the same codec to take advantage of better encoder
+                # settings (VBR + AQ + multipass vs prior constqp) on already-AV1
+                # files; without -Force, skip to avoid pointless re-encodes.
+                if (-not $ctx.Force) { return "already $($ctx.Codec)" }
+            }
 
             $subs = @(& $ctx.FFPROBE -v error -select_streams s -show_entries stream=index -of csv=p=0 $file 2>$null | Where-Object { $_ -ne '' })
             if ($subs.Count -gt 0) { return 'subtitle streams would not survive the container change' }
@@ -530,10 +535,17 @@ $workerScript = {
 
             $encArgs = @()
             if ($ctx.useGpu) {
-                $encArgs = @('-c:v', $ctx.encoder, '-preset', $ctx.nvPreset, '-cq', $ctx.cq, '-rc', 'constqp')
+                # -tune hq is harmless (no-op on AV1) but kept for parity with HEVC/H.264.
+                # constqp is intentional: VBR + multipass often produces LARGER
+                # output on already-AV1 sources, and the small-gain skip would
+                # burn 20+ minutes per file. If -Force + a lower cq is genuinely
+                # needed, user can override via -CqSwitch or the manual command.
+                $encArgs = @('-c:v', $ctx.encoder, '-preset', $ctx.nvPreset, '-tune', 'hq',
+                             '-cq', $ctx.cq, '-rc', 'constqp')
             } else {
                 $encArgs = @('-c:v', $ctx.encoder, '-crf', $ctx.cpuCrf, '-preset', $ctx.cpuPreset)
                 if ($ctx.Codec -eq 'hevc') { $encArgs += @('-tag:v', 'hvc1') }
+                if ($ctx.Codec -eq 'av1')  { $encArgs += @('-tag:v', 'av01') }
             }
             $tool = "$($ctx.encoder) cq$($ctx.cq)" + $(if ($ctx.useGpu) { ' [GPU]' } else { ' [CPU]' })
 
@@ -549,7 +561,9 @@ $workerScript = {
 
             # explicit stream maps so nothing depends on ffmpeg defaults:
             # first video stream + ALL audio tracks, audio bit-exact
-            $argsList = @('-y', '-v', 'error', '-i', $src, '-map', '0:v:0', '-map', '0:a?') +
+            $argsList = @('-y', '-v', 'error')
+            if ($ctx.useGpu) { $argsList += @('-hwaccel', 'cuda') }
+            $argsList += @('-i', $src, '-map', '0:v:0', '-map', '0:a?') +
                 $encArgs + @('-c:a', 'copy', '-movflags', '+faststart', '-progress', $progFile, '-nostats') +
                 $metaArgs + @($tmp)
             & $ctx.FFMPEG @argsList 2>&1 | Out-Null
@@ -665,6 +679,7 @@ $ctx = @{
     Mp4AudioCodecs = $script:Mp4AudioCodecs
     TargetCodecName = $Codec
     ConvertExtension = [bool]$ConvertExt
+    Force = [bool]$Force
 }
 
 # ============================================================ runspace pools
